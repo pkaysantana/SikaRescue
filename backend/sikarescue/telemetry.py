@@ -14,7 +14,7 @@ Traces are exported only when a Logfire token (or local Logfire credentials) is 
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from importlib import metadata
@@ -89,10 +89,12 @@ def configure_telemetry(
     environment: str = "dev",
     capture_model_content: bool = True,
     configure_logfire: bool = True,
+    span_processors: Sequence[Any] = (),
 ) -> TelemetryStatus:
     """Configure Logfire + Pydantic AI instrumentation. Never raises.
 
     `configure_logfire=False` reuses an already-configured Logfire (e.g. the `capfire` fixture).
+    `span_processors` are extra OpenTelemetry processors (e.g. an in-memory one for live checks).
     """
     global _status
     try:
@@ -108,6 +110,7 @@ def configure_telemetry(
                 console=False,
                 inspect_arguments=False,
                 scrubbing=logfire.ScrubbingOptions(extra_patterns=list(PII_SCRUB_PATTERNS)),
+                additional_span_processors=list(span_processors) or None,
             )
         logfire.instrument_pydantic_ai(include_content=capture_model_content)
         config = logfire.DEFAULT_LOGFIRE_INSTANCE.config

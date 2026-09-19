@@ -197,8 +197,17 @@ failures. `orchestrator` is one of `pydantic_ai`, `deterministic_fallback` or `d
 `gateway/<provider>:<model>` strings are resolved with `gateway_provider(...)`, so an
 optional `SIKARESCUE_GATEWAY_ROUTE` (a BYOK provider slug or a gateway endpoint with
 failover) applies. Credentials come only from the environment (`PYDANTIC_AI_GATEWAY_API_KEY`;
-the base URL is inferred from the key's region). Default model:
-`gateway/anthropic:claude-haiku-4-5`.
+the base URL is inferred from the key's region; the Connect tab's `.../proxy/<route>` form is
+also accepted). Verified live on 2026-09-19: `gateway/openai-chat:models/gemini-3.8-flash` on Gateway route `sr`
+(Gemini 3.8 Flash behind a custom OpenAI-compatible provider; the response header
+`pydantic-ai-gateway-active-provider: sr` confirms the routing).
+
+**Gemini 3 thought signatures.** Gemini 3 returns a `thought_signature` with each tool call
+(on the Chat Completions path, in `tool_calls[].extra_content`) and rejects the next request
+with HTTP 400 unless it is sent back verbatim. Pydantic AI 2.46's OpenAI Chat model drops that
+field, so `agent/model.py` uses `SignaturePreservingChatModel`, a thin subclass that keeps
+`extra_content` on the `ToolCallPart` and echoes it. It is a no-op for providers that never
+send the field. `backend/tests/test_gateway_model.py` checks the round trip at the HTTP level.
 
 ### Recovery decision context (the domain-specific optimisation)
 

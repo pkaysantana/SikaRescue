@@ -36,9 +36,12 @@ class Settings(BaseSettings):
     # Pydantic AI advice layer (Phase 5). `deterministic` never calls a model.
     agent_mode: Literal["deterministic", "pydantic"] = "deterministic"
     # Pydantic AI model string. `gateway/<provider>:<model>` routes through Pydantic AI Gateway.
-    agent_model: str = "gateway/anthropic:claude-haiku-4-5"
-    # Optional Gateway route: a provider slug or gateway-endpoint slug (Logfire -> Gateway).
-    gateway_route: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$")
+    # Default (verified live): Gemini 3.8 Flash on the custom Gateway route `sr`, which speaks
+    # OpenAI Chat Completions. Pydantic AI 2.46 cannot parse a custom route slug in the model
+    # string (`gateway/<slug>:...`), so the API flavour goes there and the slug goes in the route.
+    agent_model: str = "gateway/openai-chat:models/gemini-3.8-flash"
+    # Gateway route: a provider or gateway-endpoint slug (Logfire -> Gateway).
+    gateway_route: str | None = Field(default="sr", pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$")
     # Per model request (HTTP) and whole agent run. On breach: deterministic fallback.
     agent_request_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
     agent_run_timeout_seconds: float = Field(default=60.0, gt=0, le=300)

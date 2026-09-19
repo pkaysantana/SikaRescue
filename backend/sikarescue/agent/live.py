@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sikarescue.agent.model import describe_model, missing_configuration
+from sikarescue.agent.model import ModelUnavailableError, describe_model, missing_configuration
 from sikarescue.config import Settings
 
 # Response headers worth showing (Gateway/guardrail/usage metadata). Never auth or cookies.
@@ -24,7 +24,10 @@ _HIDDEN_HEADERS = ("authorization", "cookie", "set-cookie", "api-key", "x-api-ke
 def preflight(settings: Settings, model_name: str | None = None) -> tuple[list[str], list[str]]:
     """(report lines, missing setup steps) for the configured model and telemetry."""
     name = model_name or settings.agent_model
-    choice = describe_model(name, settings.gateway_route)
+    try:
+        choice = describe_model(name, settings.gateway_route, base_url=settings.gateway_base_url)
+    except ModelUnavailableError as exc:
+        return [f"model                    : {name}"], [f"a consistent configuration ({exc})"]
     lines = [
         f"model                    : {choice.label}",
         "PYDANTIC_AI_GATEWAY_API_KEY: " + ("set" if settings.gateway_api_key else "NOT set"),
@@ -41,9 +44,11 @@ def preflight(settings: Settings, model_name: str | None = None) -> tuple[list[s
 
 @dataclass
 class HeaderRecorder:
-    """httpx/httpx2 response hook: keeps status + selected headers of every model response."""
+    """httpx/httpx2 response hook: keeps status, destination and selected headers of every
+    model response, so where a request really went is observed, not inferred from config."""
 
     responses: list[tuple[int, dict[str, str]]] = field(default_factory=list)
+    destinations: list[str] = field(default_factory=list)  # scheme://host/path, no query
 
     async def __call__(self, response: Any) -> None:
         headers = {
@@ -53,6 +58,9 @@ class HeaderRecorder:
             and (k.lower().startswith("x-") or any(h in k.lower() for h in _HEADER_HINTS))
         }
         self.responses.append((response.status_code, headers))
+        url = getattr(getattr(response, "request", None), "url", None)
+        if url is not None:
+            self.destinations.append(f"{url.scheme}://{url.host}{url.path}")
 
     def client(self, timeout_seconds: float = 30.0) -> Any:
         import httpx2  # the HTTP client Pydantic AI's Gateway provider uses

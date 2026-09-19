@@ -17,6 +17,7 @@ from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import Field
+from pydantic_ai import ModelResponse
 from pydantic_ai.exceptions import (
     ModelAPIError,
     ModelHTTPError,
@@ -48,7 +49,9 @@ from sikarescue.models import (
 )
 from sikarescue.services.recovery import RecoveryService
 
-DEFAULT_MODEL = "gateway/anthropic:claude-haiku-4-5"
+# Verified live 2026-09-19: Gemini 3.8 Flash on Gateway route `sr` (OpenAI Chat Completions).
+DEFAULT_MODEL = "gateway/openai-chat:models/gemini-3.8-flash"
+DEFAULT_GATEWAY_ROUTE = "sr"
 MAX_OUTPUT_TOKENS = 2048
 
 
@@ -75,6 +78,8 @@ class AdvisoryOutcome(DomainModel):
     advice: RecoveryAdvice  # display-only
     context: RecoveryDecisionContext
     model: str | None = None
+    # The model name the provider itself reported on the run's responses (runtime evidence).
+    provider_model: str | None = None
     via_gateway: bool = False
     gateway_route: str | None = None
     fallback_reason: str | None = None
@@ -89,7 +94,7 @@ class AdvisoryOutcome(DomainModel):
 class AdvisorConfig:
     mode: Literal["deterministic", "pydantic"] = "deterministic"
     model_name: str = DEFAULT_MODEL
-    gateway_route: str | None = None
+    gateway_route: str | None = DEFAULT_GATEWAY_ROUTE
     request_timeout_seconds: float = 20.0
     run_timeout_seconds: float = 60.0
     max_model_requests: int = 8
@@ -111,7 +116,7 @@ class AdvisorConfig:
 def describe_failure(exc: BaseException, config: AdvisorConfig) -> str:
     """Short, secret-free reason for the fallback (never includes response bodies)."""
     if isinstance(exc, ModelUnavailableError):
-        return f"no model provider configured: {exc}"
+        return f"model unavailable: {exc}"
     if isinstance(exc, TimeoutError):
         return f"agent run exceeded {config.run_timeout_seconds:g}s"
     if isinstance(exc, ModelHTTPError):
@@ -129,12 +134,32 @@ def describe_failure(exc: BaseException, config: AdvisorConfig) -> str:
     return f"{type(exc).__name__}: {' '.join(str(exc).split())[:160]}"
 
 
+_EFFECT_NAMES = {
+    "SENDER_DEBIT": "the sender debit",
+    "FX_CONVERSION": "the GBP→GHS FX conversion",
+    "GH_SETTLEMENT": "the Ghana settlement",
+    "RECIPIENT_CREDIT": "the recipient credit",
+}
+_BACKEND_NAMES = {"modal": "Modal", "local": "local compute"}
+
+
+def _sentence(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def _joined(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
 def deterministic_advice(context: RecoveryDecisionContext) -> RecoveryAdvice:
     """The same RecoveryAdvice shape, written by code from the deterministic facts only."""
     plan = context.selected_plan
     obligation = context.outstanding_obligation
     selected = next(r for r in context.candidate_routes if r.rail_id == plan.rail_id)
-    done = ", ".join(e.operation.value.lower().replace("_", " ") for e in context.completed_effects)
+    effects = [
+        _EFFECT_NAMES.get(e.operation.value, e.operation.value) for e in context.completed_effects
+    ]
+    done = _sentence(_joined(effects) + " succeeded") if effects else "Nothing has settled yet"
     failure = context.failure
     if failure is None:
         failed = "The payout did not complete."
@@ -155,17 +180,18 @@ def deterministic_advice(context: RecoveryDecisionContext) -> RecoveryAdvice:
             f"{s.scenario.value.lower().replace('_', ' ')} {s.reliability:.1%}"
             for s in selected.stress
         )
+        backend = _BACKEND_NAMES.get(context.compute.backend, context.compute.backend)
         stress_summary = (
             f"{plan.rail_id} succeeded in {selected.simulated_reliability:.1%} of simulated "
             f"normal runs ({context.compute.simulated_outcomes:,} synthetic outcomes on "
-            f"{context.compute.backend}). Under stress: {stress}."
+            f"{backend}). Under stress: {stress}."
         )
     else:
         stress_summary = f"{plan.rail_id} was simulated under normal conditions only."
     return RecoveryAdvice(
         transaction_id=context.transaction_id,
         plan_id=plan.plan_id,
-        incident_summary=f"{context.transaction_id}: {done} succeeded. {failed} "
+        incident_summary=f"{context.transaction_id}: {done}. {failed} "
         f"Funds are held at {context.funds_location}.",
         funds_location=context.funds_location,
         why_origin_retry_is_unsafe=why,
@@ -211,9 +237,18 @@ class RecoveryAdvisor:
         if self._model is not None:
             return None
         try:
-            return describe_model(self.config.model_name, self.config.gateway_route)
+            return describe_model(
+                self.config.model_name,
+                self.config.gateway_route,
+                base_url=self._current_settings().gateway_base_url,
+            )
         except ModelUnavailableError:
             return None
+
+    def _current_settings(self) -> Settings:
+        if self._settings is None:
+            self._settings = Settings()
+        return self._settings
 
     async def advise(self, transaction_id: str) -> AdvisoryOutcome:
         started = time.perf_counter()
@@ -256,8 +291,13 @@ class RecoveryAdvisor:
         if self._model is not None:
             model = self._model
         else:
-            choice = describe_model(self.config.model_name, self.config.gateway_route)
-            model = build_model(choice, self._settings or Settings(), http_client=self._http_client)
+            settings = self._current_settings()
+            choice = describe_model(
+                self.config.model_name,
+                self.config.gateway_route,
+                base_url=settings.gateway_base_url,
+            )
+            model = build_model(choice, settings, http_client=self._http_client)
         model_label = choice.name if choice else model.model_name
         telemetry.event(
             "agent_run_started",
@@ -296,12 +336,21 @@ class RecoveryAdvisor:
         if problems:
             raise AdviceRejectedError("; ".join(problems))
         usage = result.usage
+        provider_model = next(
+            (
+                m.model_name
+                for m in reversed(result.all_messages())
+                if isinstance(m, ModelResponse) and m.model_name
+            ),
+            None,
+        )
         return AdvisoryOutcome(
             orchestrator=Orchestrator.PYDANTIC_AI,
             plan=plan,
             advice=advice,
             context=context,
             model=model_label,
+            provider_model=provider_model,
             via_gateway=bool(choice and choice.via_gateway),
             gateway_route=choice.route if choice else None,
             tool_calls=tuple(toolbox.calls),

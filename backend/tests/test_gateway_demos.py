@@ -126,6 +126,13 @@ def test_header_recorder_keeps_gateway_headers_and_drops_credentials():
             "x-pydantic-guardrails": "phone:redact",
             "content-type": "application/json",
         },
+        request=SimpleNamespace(
+            url=SimpleNamespace(
+                scheme="https",
+                host="gateway-eu.pydantic.dev",
+                path="/proxy/sikarescue-gemini/chat/completions",
+            )
+        ),
     )
     asyncio.run(recorder(response))
     assert recorder.gateway_headers() == {
@@ -133,6 +140,10 @@ def test_header_recorder_keeps_gateway_headers_and_drops_credentials():
         "x-pydantic-guardrails": "phone:redact",
     }
     assert recorder.guardrail_headers() == {"x-pydantic-guardrails": "phone:redact"}
+    # Where the request really went is recorded (no query string, never credentials).
+    assert recorder.destinations == [
+        "https://gateway-eu.pydantic.dev/proxy/sikarescue-gemini/chat/completions"
+    ]
 
 
 def _script(name: str, *args: str, tmp_path: Path) -> subprocess.CompletedProcess:
@@ -155,7 +166,13 @@ def _script(name: str, *args: str, tmp_path: Path) -> subprocess.CompletedProces
 
 
 @pytest.mark.parametrize(
-    "script", ["agent_smoke.py", "gateway_guardrail_demo.py", "gateway_optimization_demo.py"]
+    "script",
+    [
+        "agent_smoke.py",
+        "gateway_ping.py",
+        "gateway_guardrail_demo.py",
+        "gateway_optimization_demo.py",
+    ],
 )
 def test_live_scripts_refuse_without_credentials(script, tmp_path):
     result = _script(script, tmp_path=tmp_path)

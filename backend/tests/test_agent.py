@@ -21,7 +21,13 @@ from sikarescue.agent.advisor import (
     RecoveryAdvisor,
     deterministic_advice,
 )
-from sikarescue.agent.model import build_model, describe_model, missing_configuration
+from sikarescue.agent.model import (
+    ModelUnavailableError,
+    build_model,
+    describe_model,
+    gateway_endpoint,
+    missing_configuration,
+)
 from sikarescue.agent.recovery_agent import AGENT_TOOL_NAMES, advice_problems, recovery_agent
 from sikarescue.cli.demo import run_demo
 from sikarescue.compute.backend import LocalRouteComputeBackend
@@ -316,6 +322,89 @@ def test_gateway_models_are_wired_offline_from_environment_config():
     assert model.base_url == "https://gateway-eu.pydantic.dev/proxy/sikarescue-openai/"
     assert missing_configuration(choice, settings) == []
     assert missing_configuration(choice, Settings(_env_file=None)) != []
+
+
+CONNECT_MODEL = "gateway/google-gemini-hackathon:models/gemini-3.8-flash"  # SDK cannot parse
+LIVE_MODEL = "gateway/openai-chat:models/gemini-3.8-flash"
+
+
+def test_default_model_is_the_verified_live_gateway_path_without_google_key(monkeypatch):
+    for name in ("SIKARESCUE_AGENT_MODEL", "SIKARESCUE_GATEWAY_ROUTE", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(_env_file=None, PYDANTIC_AI_GATEWAY_API_KEY="pylf_v2_eu_" + "k" * 24)
+    assert settings.agent_model == LIVE_MODEL and settings.gateway_route == "sr"
+    choice = describe_model(settings.agent_model, settings.gateway_route)
+    assert choice.via_gateway and choice.route == "sr"
+    model = build_model(choice, settings)
+    assert model.base_url == "https://gateway-eu.pydantic.dev/proxy/sr/"
+    # The Gateway path needs only the Gateway key: the Google key lives in the BYOK provider.
+    assert missing_configuration(choice, settings) == []
+
+
+async def test_a_model_string_the_sdk_cannot_resolve_falls_back_without_breaking(world, txn_id):
+    advisor = RecoveryAdvisor(
+        world.service,
+        AdvisorConfig(mode="pydantic", model_name=CONNECT_MODEL),
+        settings=Settings(_env_file=None, PYDANTIC_AI_GATEWAY_API_KEY="pylf_v2_eu_" + "k" * 24),
+    )
+    outcome = await advisor.advise(txn_id)
+    assert outcome.orchestrator is Orchestrator.DETERMINISTIC_FALLBACK
+    assert outcome.fallback_reason and outcome.plan.rail_id is RailId.MOMO_B
+    assert world.repository.get(txn_id).state is RecoveryState.AWAITING_APPROVAL
+
+
+@pytest.mark.parametrize(
+    ("base_url", "route", "expected"),
+    [
+        (None, "sikarescue-gemini", (None, "sikarescue-gemini")),
+        (
+            "https://gateway-eu.pydantic.dev/proxy",
+            "sikarescue-gemini",
+            ("https://gateway-eu.pydantic.dev/proxy", "sikarescue-gemini"),
+        ),
+        # The Connect tab's full endpoint URL: the route is taken from it, never appended twice.
+        (
+            "https://gateway-eu.pydantic.dev/proxy/sikarescue-gemini",
+            None,
+            ("https://gateway-eu.pydantic.dev/proxy", "sikarescue-gemini"),
+        ),
+        (
+            "https://gateway-eu.pydantic.dev/proxy/sikarescue-gemini/",
+            "sikarescue-gemini",
+            ("https://gateway-eu.pydantic.dev/proxy", "sikarescue-gemini"),
+        ),
+    ],
+    ids=["no-base-url", "proxy-root", "connect-url", "connect-url-same-route"],
+)
+def test_gateway_base_url_forms_resolve_to_one_route(base_url, route, expected):
+    assert gateway_endpoint(base_url, route) == expected
+
+
+def test_full_gateway_url_is_used_without_doubling_the_route():
+    settings = Settings(
+        _env_file=None,
+        PYDANTIC_AI_GATEWAY_API_KEY="pylf_v2_eu_" + "k" * 24,
+        PYDANTIC_AI_GATEWAY_BASE_URL="https://gateway-eu.pydantic.dev/proxy/sikarescue-gemini",
+    )
+    choice = describe_model(
+        "gateway/openai-chat:gemini-3.8-flash", None, base_url=settings.gateway_base_url
+    )
+    assert choice.route == "sikarescue-gemini"
+    model = build_model(choice, settings)
+    assert model.base_url == "https://gateway-eu.pydantic.dev/proxy/sikarescue-gemini/"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://gateway-eu.pydantic.dev/proxy/another-route",
+        "https://gateway-eu.pydantic.dev/proxy/sikarescue-gemini/chat",
+    ],
+    ids=["conflicting-route", "nested-path"],
+)
+def test_ambiguous_gateway_base_url_is_refused(base_url):
+    with pytest.raises(ModelUnavailableError):
+        gateway_endpoint(base_url, "sikarescue-gemini")
 
 
 async def test_deterministic_planning_errors_are_not_masked_as_model_failures():
