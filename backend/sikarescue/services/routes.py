@@ -1,15 +1,14 @@
 """Route discovery (from live state) and independent verification of compute results.
 
-Evaluation itself (hard filters -> simulation -> scoring) lives in `sikarescue.compute` so
-any compute backend can run it. This module only builds candidates from the repository and
-re-verifies whatever a backend returns before it may influence a plan.
+Evaluation (hard filters -> simulation -> scoring) and its independent verification live in
+`sikarescue.compute` so every backend shares them. This module builds candidates from the
+repository; `verify_evaluations` is re-exported for the recovery service.
 """
 
 from __future__ import annotations
 
 from sikarescue.compute.constraints import hard_constraint_violations
-from sikarescue.compute.evaluation import ranking_key, scoring_input
-from sikarescue.compute.scoring import score_route
+from sikarescue.compute.verification import verify_evaluations
 from sikarescue.models import (
     AttemptOutcome,
     CandidateRecoveryRoute,
@@ -17,7 +16,6 @@ from sikarescue.models import (
     OperationType,
     OutstandingObligation,
     RailId,
-    RouteEvaluation,
     route_id_for,
 )
 from sikarescue.services.liquidity import LiquidityBook
@@ -92,39 +90,3 @@ def eligibility_of(candidate: CandidateRecoveryRoute) -> EligibilitySnapshot:
         liquidity_sufficient=candidate.liquidity.sufficient,
         recipient_compatible=candidate.recipient_compatible,
     )
-
-
-def verify_evaluations(
-    candidates: tuple[CandidateRecoveryRoute, ...],
-    evaluations: tuple[RouteEvaluation, ...],
-) -> list[str]:
-    """Re-derive everything except the Monte Carlo statistics. Empty list = trustworthy.
-
-    A compute backend can therefore never admit a policy-denied / down / incompatible /
-    illiquid route, alter a fee, or change a score or rank: only simulated statistics are
-    taken from it, and those feed the locally recomputed score.
-    """
-    by_route = {e.route_id: e for e in evaluations}
-    if len(by_route) != len(evaluations) or set(by_route) != {c.route_id for c in candidates}:
-        return ["evaluations do not correspond one-to-one with the candidates"]
-    problems: list[str] = []
-    passing: list[tuple[tuple, int]] = []
-    for c in candidates:
-        e = by_route[c.route_id]
-        rail_id = c.rail.rail_id
-        expected = tuple(reason for reason, _ in hard_constraint_violations(c))
-        if e.rail_id is not rail_id or e.rejection_reasons != expected:
-            problems.append(f"{rail_id}: hard-constraint result differs from local check")
-            continue
-        if e.estimated_incremental_cost != c.quote.incremental_fee:
-            problems.append(f"{rail_id}: incremental fee differs from the quote")
-        if e.passed:
-            recomputed = score_route(scoring_input(c, e.scenario_results[0]))
-            if recomputed != e.score:
-                problems.append(f"{rail_id}: score differs from local recomputation")
-            assert e.rank is not None
-            passing.append((ranking_key(recomputed.total, c), e.rank))
-    ranks_in_expected_order = [rank for _, rank in sorted(passing)]
-    if ranks_in_expected_order != list(range(1, len(passing) + 1)):
-        problems.append("ranking differs from local recomputation")
-    return problems

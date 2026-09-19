@@ -8,6 +8,7 @@ import pytest
 
 from sikarescue.compute import evaluation as evaluation_module
 from sikarescue.compute.backend import (
+    FallbackComputeBackend,
     LocalRouteComputeBackend,
     RouteComputeBackend,
     build_compute_backend,
@@ -192,8 +193,9 @@ async def test_revision_change_while_backend_computes_is_rejected(txn_id):
 
 def test_backend_selection_from_configuration(monkeypatch):
     assert isinstance(build_compute_backend("local"), LocalRouteComputeBackend)
-    with pytest.raises(ConfigurationError, match="Phase 4"):
-        build_compute_backend("modal")
+    modal = build_compute_backend("modal")  # lazy: no network until first evaluation
+    assert isinstance(modal, FallbackComputeBackend) and modal.name == "modal"
+    assert isinstance(modal.fallback, LocalRouteComputeBackend)
     with pytest.raises(ConfigurationError, match="unknown"):
         build_compute_backend("gpu-cluster")
     monkeypatch.setenv("SIKARESCUE_COMPUTE_BACKEND", "local")

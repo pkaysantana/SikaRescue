@@ -168,7 +168,7 @@ class RecoveryService:
         """Read-only evaluation of the current candidates (no plan is created)."""
         candidates = self.discover_recovery_routes(transaction_id)
         batch = await self._run_compute(transaction_id, candidates)
-        problems = verify_evaluations(candidates, batch.evaluations)
+        problems = verify_evaluations(candidates, batch.evaluations, self.simulation_config)
         if problems:
             raise ComputeIntegrityError(problems)
         return batch.evaluations
@@ -321,12 +321,23 @@ class RecoveryService:
         if drift:
             self._discard_planning_result(aggregate, drift)
         # Never trust a compute backend blindly: re-derive constraints, money, scores, ranks.
-        problems = verify_evaluations(snapshot.candidates, batch.evaluations)
+        problems = verify_evaluations(
+            snapshot.candidates, batch.evaluations, self.simulation_config
+        )
         if problems:
             self._discard_planning_result(aggregate, problems, ComputeIntegrityError(problems))
 
         evaluations = batch.evaluations
         summary = batch.summary
+        if summary.fallback_from:
+            aggregate.record_audit(
+                AuditEventType.COMPUTE_FALLBACK,
+                ENGINE,
+                f"{summary.fallback_from} compute unavailable; evaluated with "
+                f"{summary.backend} instead ({summary.fallback_reason})"[:280],
+                fallback_from=summary.fallback_from,
+                fallback_reason=summary.fallback_reason,
+            )
         passing = [e for e in evaluations if e.passed]
         rejected = [e for e in evaluations if not e.passed]
         aggregate.record_audit(
@@ -336,6 +347,8 @@ class RecoveryService:
             evaluated=len(passing),
             rejected=len(rejected),
             compute_backend=summary.backend,
+            fallback_from=summary.fallback_from,
+            parallel_jobs=summary.parallel_jobs,
             simulated_trials=summary.simulated_trials,
             compute_elapsed_ms=round(summary.elapsed_seconds * 1000, 1),
             seed=summary.seed,

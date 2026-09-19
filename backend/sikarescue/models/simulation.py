@@ -100,7 +100,11 @@ class RouteSimulationResult(DomainModel):
 
 
 class ComputeRunSummary(DomainModel):
-    """Provenance of one route-evaluation compute run (reproducible from seed + inputs)."""
+    """Provenance of one route-evaluation compute run (reproducible from seed + inputs).
+
+    `backend` names the backend that PRODUCED the statistics. When a remote backend failed
+    and the local one stood in, `fallback_from`/`fallback_reason` say so explicitly.
+    """
 
     backend: str = Field(min_length=1, max_length=32)
     seed: int = Field(ge=0)
@@ -108,5 +112,19 @@ class ComputeRunSummary(DomainModel):
     scenarios: tuple[ScenarioId, ...] = Field(min_length=1)
     routes_simulated: int = Field(ge=0)
     simulated_trials: int = Field(ge=0)
-    elapsed_seconds: float = Field(ge=0)
+    elapsed_seconds: float = Field(ge=0)  # wall-clock, as seen by the caller
+    shards_per_scenario: int = Field(default=1, ge=1)
+    parallel_jobs: int = Field(default=0, ge=0)  # remote function inputs (0 = in-process)
+    remote_compute_seconds: float | None = Field(default=None, ge=0)  # summed across jobs
+    function_ref: str | None = Field(default=None, max_length=120)
+    fallback_from: str | None = Field(default=None, max_length=32)
+    fallback_reason: str | None = Field(default=None, max_length=280)
     synthetic: Literal[True] = True
+
+    @model_validator(mode="after")
+    def _fallback_is_explained(self) -> ComputeRunSummary:
+        if (self.fallback_from is None) != (self.fallback_reason is None):
+            raise ValueError("a fallback must name both the failed backend and the reason")
+        if self.fallback_from is not None and self.fallback_from == self.backend:
+            raise ValueError("fallback backend must differ from the failed backend")
+        return self

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Agentic failed-payment recovery for cross-rail payments (hackathon demo; all rails and money are synthetic)."
 requires-python = ">=3.12"
 dependencies = [
+    "modal>=1.5.5,<1.6",
     "pydantic>=2.11",
     "pydantic-settings>=2.6",
 ]

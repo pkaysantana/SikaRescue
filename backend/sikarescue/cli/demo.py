@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 import time
 from collections.abc import Callable
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from typing import TextIO
 
 from sikarescue.compute.backend import build_compute_backend
-from sikarescue.compute.scenarios import simulation_config
+from sikarescue.compute.scenarios import workload_config
 from sikarescue.config import get_settings
 from sikarescue.demo_data.sk10421 import TRANSACTION_ID, DemoWorld, build_demo_world
 from sikarescue.errors import ConfigurationError, SikaRescueError
@@ -155,7 +156,7 @@ async def run_demo(
         plan = await service.create_recovery_plan(TRANSACTION_ID)
     except SikaRescueError as exc:
         p(f"{FAIL} Planning stopped: {exc}")
-        _proof(p, world, planning_ms=None, candidates=None)
+        _proof(p, world, planning_ms=None, plan=None)
         return DemoOutcome(world=world, exit_code=1)
     planning_ms = (time.perf_counter() - started) * 1000
     passing = [e for e in plan.evaluations if e.passed]
@@ -175,14 +176,32 @@ async def run_demo(
     summary = plan.compute
     assert summary is not None
     p(
-        f"Simulate : {summary.simulated_trials:,} synthetic executions = "
+        f"Simulate : {summary.simulated_trials:,} synthetic recovery outcomes = "
         f"{summary.routes_simulated} routes x {len(summary.scenarios)} scenarios x "
         f"{summary.trials_per_scenario:,} trials"
     )
-    p(
-        f"           backend={summary.backend}  seed={summary.seed}  "
-        f"{summary.elapsed_seconds * 1000:.0f} ms  (rejected routes: 0 trials)"
-    )
+    p(f"           scenarios: {', '.join(s.value.lower() for s in summary.scenarios)}")
+    if summary.parallel_jobs:
+        p(
+            f"           backend={summary.backend}  parallel jobs={summary.parallel_jobs} "
+            f"({summary.shards_per_scenario} shards per route x scenario)  seed={summary.seed}"
+        )
+        p(
+            f"           wall {summary.elapsed_seconds:.2f} s  remote compute "
+            f"{summary.remote_compute_seconds or 0:.2f} CPU-s  function {summary.function_ref}"
+        )
+    else:
+        p(
+            f"           backend={summary.backend} (in-process)  seed={summary.seed}  "
+            f"{summary.elapsed_seconds:.2f} s"
+        )
+    if summary.fallback_from:
+        p(
+            f"{WARN} {summary.fallback_from} compute unavailable -> evaluated with "
+            f"{summary.backend} instead"
+        )
+        p(f"           reason: {summary.fallback_reason}")
+    p("           rejected routes: 0 trials (never sent for simulation)")
     p("Rank     : synthetic score = 40% simulated reliability + 25% cost")
     p("           + 20% simulated p95 latency + 15% route quality")
     for e in passing:
@@ -220,7 +239,7 @@ async def run_demo(
             plan.plan_id, plan_hash=plan.plan_hash, approver=APPROVER, comment="declined in CLI"
         )
         p(f"{FAIL} Plan declined → transaction escalated to MANUAL_REVIEW. No money moved.")
-        _proof(p, world, planning_ms=planning_ms, candidates=plan.evaluations)
+        _proof(p, world, planning_ms=planning_ms, plan=plan)
         return DemoOutcome(world=world, exit_code=1, plan=plan)
     await service.approve_recovery(plan.plan_id, plan_hash=plan.plan_hash, approver=APPROVER)
 
@@ -231,7 +250,7 @@ async def run_demo(
     if execution.status is not ExecutionStatus.SUCCEEDED:
         p(f"{FAIL} Payout outcome {execution.status}: {execution.detail}")
         p("No automatic retry or reroute: value may have moved. Manual review required.")
-        _proof(p, world, planning_ms=planning_ms, candidates=plan.evaluations)
+        _proof(p, world, planning_ms=planning_ms, plan=plan)
         return DemoOutcome(world=world, exit_code=1, plan=plan, execution=execution)
     p(f"{OK} Recipient credited {_money(plan.amount)} via {plan.rail_id}")
     p(f"{OK} Sender NOT debited again (sender debit effect replay is structurally impossible)")
@@ -242,7 +261,7 @@ async def run_demo(
     for check in reconciliation.checks:
         p(f"  {OK if check.passed else FAIL} {check.name:<30} {check.detail}")
 
-    _proof(p, world, planning_ms=planning_ms, candidates=plan.evaluations)
+    _proof(p, world, planning_ms=planning_ms, plan=plan)
     if show_timeline:
         _timeline(p, world)
     return DemoOutcome(
@@ -282,7 +301,7 @@ def _proof(
     world: DemoWorld,
     *,
     planning_ms: float | None,
-    candidates: tuple[RouteEvaluation, ...] | None,
+    plan: RecoveryPlan | None,
 ) -> None:
     state = world.service.get_transaction_state(TRANSACTION_ID)
     p.section("Proof")
@@ -292,10 +311,23 @@ def _proof(
     p(f"duplicate sender debits  : {max(0, state.sender_debit_count - 1)}")
     p(f"funds located            : {state.funds_location}")
     p(f"state                    : {state.recovery_state}")
-    p(f"compute backend          : {world.service.compute_backend}")
-    if candidates is not None:
-        rejected = sum(1 for e in candidates if not e.passed)
-        p(f"candidate routes         : {len(candidates)} ({rejected} rejected by hard constraints)")
+    summary = plan.compute if plan is not None else None
+    if summary is None:
+        p(f"compute backend          : {world.service.compute_backend} (configured)")
+    elif summary.fallback_from:
+        p(f"compute backend          : {summary.backend} (fallback from {summary.fallback_from})")
+    else:
+        p(f"compute backend          : {summary.backend}")
+    if summary is not None and summary.parallel_jobs:
+        p(f"parallel compute jobs    : {summary.parallel_jobs}")
+    if summary is not None:
+        p(f"simulated outcomes       : {summary.simulated_trials:,}")
+    if plan is not None:
+        rejected = sum(1 for e in plan.evaluations if not e.passed)
+        p(
+            f"candidate routes         : {len(plan.evaluations)} "
+            f"({rejected} rejected by hard constraints)"
+        )
     if planning_ms is not None:
         p(f"recovery planning latency: {planning_ms:.0f} ms")
 
@@ -322,15 +354,21 @@ def main(argv: list[str] | None = None) -> int:
     _ensure_utf8_stdout()
     settings = get_settings()
     try:
-        compute = build_compute_backend(settings.compute_backend)
+        compute = build_compute_backend(
+            settings.compute_backend,
+            remote_timeout_seconds=settings.modal_timeout_seconds,
+            shards_per_scenario=settings.modal_shards_per_scenario,
+        )
     except ConfigurationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     world = build_demo_world(
         payout_latency_seconds=settings.payout_latency_seconds,
         payout_timeout_seconds=settings.payout_timeout_seconds,
         compute=compute,
-        simulation=simulation_config(
+        simulation=workload_config(
+            settings.effective_workload,
             seed=settings.simulation_seed,
             trials_per_scenario=settings.simulation_trials_per_scenario,
         ),
