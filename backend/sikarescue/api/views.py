@@ -15,14 +15,29 @@ from pydantic import BaseModel, ConfigDict
 
 from sikarescue import telemetry
 from sikarescue.agent.advisor import AdvisoryOutcome, Orchestrator
+from sikarescue.agent.evidence import EvidenceExtraction
+from sikarescue.api.control_views import (
+    CounterfactualView,
+    EffectNodeView,
+    FrontierView,
+    FundsPositionView,
+    IncidentView,
+    PreviewView,
+    build_counterfactual_view,
+    build_frontier_view,
+    build_funds_position_view,
+    build_graph_view,
+    build_incident_view,
+    build_preview_view,
+)
+from sikarescue.api.formatting import money, pct
+from sikarescue.demo_data.incidents import SCENARIO_LABELS, IncidentScenario
 from sikarescue.demo_data.sk10421 import SCENARIO_ID, DemoWorld
 from sikarescue.models import (
     AuditEventType,
-    Currency,
     ExecutionResult,
     FundsCertainty,
     FundsLocation,
-    Money,
     OperationType,
     RailId,
     ReconciliationResult,
@@ -37,7 +52,7 @@ class View(BaseModel):
     model_config = ConfigDict(frozen=True)
 
 
-NextAction = Literal["analyse", "approve", "execute", "done", "manual_review"]
+NextAction = Literal["classify", "analyse", "approve", "execute", "done", "manual_review"]
 
 _OPERATION_LABELS = {
     OperationType.SENDER_DEBIT: "Sender debit",
@@ -56,15 +71,6 @@ _SCENARIO_LABELS = {
     "REGIONAL_DISRUPTION": "Regional disruption",
     "CORRELATED_FAILURE": "Correlated failure",
 }
-
-
-def money(m: Money) -> str:
-    symbol = "£" if m.currency is Currency.GBP else f"{m.currency.value} "
-    return f"{symbol}{m.amount:,.2f}"
-
-
-def pct(p: float | None) -> str | None:
-    return None if p is None else f"{p * 100:.1f}%"
 
 
 # ------------------------------------------------------------------ transaction + journey
@@ -246,10 +252,27 @@ class TelemetryInfo(View):
     detail: str
 
 
+class ScenarioOption(View):
+    id: str
+    label: str
+
+
+class ScenarioInfo(View):
+    current: str | None  # None: a pre-classified payment (no provider incident)
+    options: list[ScenarioOption]
+
+
 class DemoView(View):
     state: RecoveryState
     next_action: NextAction
     notice: str | None  # why the flow is where it is, when that is not obvious
+    scenario: ScenarioInfo
+    incident: IncidentView | None
+    funds_position: FundsPositionView
+    effect_graph: list[EffectNodeView]
+    frontier: FrontierView
+    preview: PreviewView | None  # current vs proposed ledger for the visible plan
+    counterfactual: CounterfactualView
     configured_compute_backend: str
     agent_mode: str
     transaction: TransactionSummary
@@ -269,7 +292,9 @@ class DemoView(View):
 # ------------------------------------------------------------------ builders
 
 
-def _next_action(state: RecoveryState, plan_visible: bool) -> NextAction:
+def _next_action(state: RecoveryState, plan_visible: bool, evidence_pending: bool) -> NextAction:
+    if evidence_pending:
+        return "classify"  # nothing may be planned until the provider response is classified
     if state in (RecoveryState.FAILED, RecoveryState.DIAGNOSING, RecoveryState.RECOVERY_FAILED):
         return "analyse"
     if state in (RecoveryState.AWAITING_APPROVAL, RecoveryState.APPROVED) and not plan_visible:
@@ -286,6 +311,11 @@ def _next_action(state: RecoveryState, plan_visible: bool) -> NextAction:
 def _notice(
     aggregate: TransactionAggregate, state: TransactionState, plan_visible: bool
 ) -> str | None:
+    if state.evidence_pending:
+        return (
+            "MOMO_A answered the payout, but the response is not classified yet, so the funds "
+            "position is unproven. Classify the provider evidence before anything is planned."
+        )
     current = aggregate.current_plan
     awaiting = aggregate.state in (RecoveryState.AWAITING_APPROVAL, RecoveryState.APPROVED)
     if awaiting and not plan_visible and current is not None:
@@ -476,6 +506,8 @@ def build_view(
     agent_mode: str,
     resets: int,
     retired_instance_ids: list[str] | tuple[str, ...] = (),
+    scenario: IncidentScenario | None = None,
+    extraction: EvidenceExtraction | None = None,
 ) -> DemoView:
     aggregate = world.repository.get(world.transaction_id)
     instruction = aggregate.instruction
@@ -491,10 +523,38 @@ def build_view(
         (e for e in aggregate.executions.values() if plan and e.plan_id == plan.plan_id), None
     )
     proven = state.funds_certainty is FundsCertainty.PROVEN
+    names = {rail.rail_id: _rail_name(world, rail.rail_id.value) for rail in world.registry.all()}
+    service = world.service
+    frontier = service.get_safe_action_frontier(world.transaction_id)
+    preview = (
+        build_preview_view(service.preview_recovery(plan.plan_id), names)
+        if plan is not None
+        and aggregate.plan_status[plan.plan_id].value in ("PENDING_APPROVAL", "APPROVED")
+        else None
+    )
     return DemoView(
         state=aggregate.state,
-        next_action=_next_action(aggregate.state, plan is not None),
+        next_action=_next_action(aggregate.state, plan is not None, state.evidence_pending),
         notice=_notice(aggregate, state, plan is not None),
+        scenario=ScenarioInfo(
+            current=scenario.value if scenario and aggregate.incident else None,
+            options=[
+                ScenarioOption(id=s.value, label=SCENARIO_LABELS[s]) for s in IncidentScenario
+            ],
+        ),
+        incident=build_incident_view(
+            aggregate.incident,
+            extraction,
+            aggregate.incident_classification,
+            exporting=status.exporting,
+        ),
+        funds_position=build_funds_position_view(frontier),
+        effect_graph=build_graph_view(service.get_effect_graph(world.transaction_id), names),
+        frontier=build_frontier_view(frontier, names),
+        preview=preview,
+        counterfactual=build_counterfactual_view(
+            service.compare_naive_retry(world.transaction_id), names
+        ),
         configured_compute_backend=world.service.compute_backend,
         agent_mode=agent_mode,
         transaction=TransactionSummary(

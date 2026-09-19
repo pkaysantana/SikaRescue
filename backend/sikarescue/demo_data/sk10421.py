@@ -6,6 +6,10 @@ recipient's identity. Reliability figures are illustrative, NOT empirical measur
 Story: sender debit, GBP->GHS FX and Ghana settlement all SUCCEEDED. The final MOMO_A
 payout was rejected with a synthetic HTTP 503 BEFORE the provider accepted the request,
 so it is DEFINITIVE_FAILED and no value moved: funds sit in GH_SETTLEMENT_ACCOUNT.
+
+With `incident=...` (the web demo) the MOMO_A outcome is NOT pre-classified: the journal
+records only that a provider response arrived, and the outcome is decided later by the
+deterministic FailureVerifier from evidence extracted from that raw response.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from pydantic import SecretStr
 
 from sikarescue.compute.backend import LocalRouteComputeBackend, RouteComputeBackend
 from sikarescue.compute.scenarios import simulation_config
+from sikarescue.demo_data.incidents import IncidentScenario, build_incident, momo_a_catalog
 from sikarescue.models import (
     Actor,
     AttemptOutcome,
@@ -35,6 +40,7 @@ from sikarescue.models import (
     OperationAttempt,
     OperationType,
     PaymentTransaction,
+    ProviderResponseReceived,
     Rail,
     RailId,
     RailQuote,
@@ -235,8 +241,12 @@ def seed_transaction(
     momo_a_outcome: AttemptOutcome = AttemptOutcome.DEFINITIVE_FAILED,
     *,
     transaction_id: str = TRANSACTION_ID,
+    incident: IncidentScenario | None = None,
 ) -> TransactionAggregate:
-    """Build the aggregate with journal evidence for the three successful legs + MOMO_A."""
+    """Build the aggregate with journal evidence for the three successful legs + MOMO_A.
+
+    With `incident`, MOMO_A's raw provider response is attached UNCLASSIFIED instead.
+    """
     if momo_a_outcome is AttemptOutcome.SUCCEEDED:
         raise ValueError("the demo scenario requires a failed MOMO_A payout")
     instruction = build_instruction(transaction_id)
@@ -289,6 +299,9 @@ def seed_transaction(
         )
 
     at = BASE_TIME + timedelta(seconds=80)
+    if incident is not None:
+        _attach_incident(aggregate, incident, at)
+        return aggregate
     source, destination = OPERATION_FLOW[OperationType.RECIPIENT_CREDIT]
     failure = _MOMO_A_FAILURES[momo_a_outcome]
     journal.record_attempt(
@@ -319,6 +332,46 @@ def seed_transaction(
     return aggregate
 
 
+def _attach_incident(
+    aggregate: TransactionAggregate, scenario: IncidentScenario, at: datetime
+) -> None:
+    transaction_id = aggregate.transaction_id
+    incident = build_incident(
+        scenario,
+        transaction_id=transaction_id,
+        attempt_id=f"att_{4:012x}",
+        idempotency_key=f"{transaction_id}:original:MOMO_A:payout",
+        amount=PAYOUT_AMOUNT,
+        recipient_token=RECIPIENT_TOKEN,
+        dispatched_at=at,
+    )
+    aggregate.incident = incident
+    aggregate.journal.record(
+        ProviderResponseReceived(
+            incident_id=incident.incident_id,
+            rail_id=incident.rail_id,
+            attempt_id=incident.attempt_id,
+            operation=OperationType.RECIPIENT_CREDIT,
+            raw_payload_digest=incident.raw_payload_digest,
+            response_received=incident.response_received,
+            http_status=incident.http_status,
+        )
+    )
+    answered = (
+        f"HTTP {incident.http_status} response"
+        if incident.response_received
+        else "no response before timeout"
+    )
+    aggregate.record_audit(
+        AuditEventType.PROVIDER_RESPONSE_RECEIVED,
+        Actor.RAIL,
+        f"MOMO_A payout dispatched; {answered}. Outcome not yet classified.",
+        rail_id=RailId.MOMO_A.value,
+        incident_id=incident.incident_id,
+        raw_payload_digest=incident.raw_payload_digest[:12],
+    )
+
+
 @dataclass
 class DemoWorld:
     transaction_id: str  # the authoritative payment instance id
@@ -339,6 +392,7 @@ def build_demo_world(
     payout_timeout_seconds: float = 30.0,
     transaction_id: str = TRANSACTION_ID,
     gateway: SimulatedPayoutGateway | None = None,
+    incident: IncidentScenario | None = None,
 ) -> DemoWorld:
     """A seeded world for ONE payment instance.
 
@@ -346,7 +400,9 @@ def build_demo_world(
     idempotency key it has seen, exactly as an external payout provider would.
     """
     repository = InMemoryTransactionRepository()
-    repository.add(seed_transaction(momo_a_outcome, transaction_id=transaction_id))
+    repository.add(
+        seed_transaction(momo_a_outcome, transaction_id=transaction_id, incident=incident)
+    )
     registry = RailRegistry(build_rails(), build_quotes(), build_simulation_profiles())
     policy = build_policy()
     liquidity = build_liquidity()
@@ -361,5 +417,6 @@ def build_demo_world(
         compute=compute or LocalRouteComputeBackend(),
         simulation_config=simulation or simulation_config(),
         payout_timeout_seconds=payout_timeout_seconds,
+        evidence_catalogs={RailId.MOMO_A: momo_a_catalog()},
     )
     return DemoWorld(transaction_id, repository, registry, policy, liquidity, gateway, service)

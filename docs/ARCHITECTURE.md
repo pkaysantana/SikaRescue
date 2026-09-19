@@ -59,6 +59,14 @@ SikaRescue is a single-process demo. Its claims are deliberately narrow.
   advice is checked against the deterministic plan and screened for personal data.
 - **Internal reconciliation checks** over this process's own journal (one sender debit, one
   recipient credit, no duplicates, funds at the recipient endpoint).
+- **Extraction never authorises.** A provider response's outcome is decided once, by the
+  deterministic FailureVerifier, from verbatim citations it checks against the raw payload and
+  our own transport log. Anything it cannot prove is UNKNOWN; a SUCCEEDED verdict is recorded
+  as UNKNOWN for manual booking. Until a response is classified nothing can be planned.
+- **No payout action under uncertainty.** The SafeActionFrontier model refuses to contain a
+  payout action unless the FundsPosition is AVAILABLE and proven.
+- **Pure previews.** The ledger preview and the naive-retry comparison never mutate state; the
+  preview posts into a throwaway journal fork and is invalid for a stale plan.
 
 **Not claimed:**
 
@@ -322,3 +330,78 @@ uv run python scripts/gateway_guardrail_demo.py --route <slug>  # LIVE guardrail
 Unit tests use Pydantic AI `FunctionModel` with `ALLOW_MODEL_REQUESTS = False` and Logfire's
 `capfire`; they never touch the network. The three scripts above are the live checks, and
 each refuses to run, and claims nothing, when its credentials are missing.
+
+## Phase 7B: recovery control plane
+
+### Failure evidence: Pydantic AI extracts, a deterministic verifier decides
+
+```
+raw synthetic provider payload + our own transport observations   (ProviderIncident)
+  -> Pydantic AI structured extraction                           (ExtractedFailureEvidence)
+  -> FailureEvidence, bound to the payload by a code-computed digest
+  -> deterministic FailureVerifier                               (EvidenceVerdict)
+  -> SUCCEEDED / DEFINITIVE_FAILED / UNKNOWN
+```
+
+The extraction agent (`agent/evidence.py`) has no tools and one output type. Its fields are
+provider, code, message, transport outcome, acceptance stage, explicit rejection, reference,
+verbatim evidence fragments and completeness; nothing in it can authorise, rank or execute.
+An output validator sends back any citation that is not verbatim in the payload.
+
+The verifier (`services/evidence.py`) fails closed. Integrity checks: payload binding, provider
+match, every cited string verbatim, transport claim consistent with what OUR client observed,
+claims consistent with each other and with the provider's documented code catalog.
+DEFINITIVE_FAILED additionally requires a received response, an explicit rejection before
+acceptance, a documented pre-acceptance code and cited evidence. Everything else is UNKNOWN.
+Without a model (not configured, or failing) the fallback reads only our transport log, so
+it can never prove a definitive failure: a missing model fails closed.
+
+Until a response is classified the journal holds only `ProviderResponseReceived`; the attempt
+is recorded once, from the verdict. Planning refuses with `EvidencePendingError` (no escalation).
+
+Two synthetic MOMO_A incidents (`demo_data/incidents.py`): an HTTP 200 whose body says
+`"status": "COMPLETED"` but shows a pre-queue rejection (MA-4017), and a read timeout whose
+only later evidence is an edge-proxy 504. The web UI switches between them by starting a new
+payment instance, never by mutating one.
+
+### Derived artifacts (never a second source of truth)
+
+- **FundsPosition**: amount, last confirmed location, status (AVAILABLE, IN_FLIGHT, UNCERTAIN,
+  FINAL), certainty, availability for automatic action, and the effect ids that prove it.
+  The Phase 7A certainty fields are derived from it.
+- **FinancialEffectGraph**: PaymentIntent -> SenderDebit -> FX -> GhanaSettlement ->
+  RecipientPayout, each node carrying only journal facts (effect key, amounts, rail, attempts).
+- **SafeActionFrontier**: candidates -> hard constraints -> eligible -> simulated -> ranked ->
+  selected, from the current fresh plan (or the live candidates before analysis). Under
+  UNKNOWN it holds only QUERY_PROVIDER (a demo abstraction), WAIT_FOR_PROVIDER_EVIDENCE and
+  MANUAL_REVIEW.
+- **Ledger preview**: current vs proposed ledger for a plan, produced by posting the effect
+  that execution would post (the same builders, `services/effects.py`) into
+  `journal.fork()`. A test checks the projection equals what execution actually posts.
+- **Naive-retry counterfactual**: which completed effects a restart from origin would repeat,
+  and whether it risks a duplicate recipient credit.
+
+### Systemic rail outage (Modal)
+
+MOMO_A fails for the whole corridor. A deterministic synthetic portfolio (40,000 outstanding
+GHS payouts, seed 10421) is allocated to fallback rails under 5 scenarios.
+
+1. Local: rail status, the same `PolicyEngine` (rail type and per-payout limit) and recipient
+   compatibility produce a per-obligation eligibility mask. Failed or denied rails are never
+   sent to compute.
+2. Modal (`allocate_outage_scenario`, one job per scenario) or local: oldest first, cheapest
+   eligible rail with both liquidity and a capacity slot. The worker regenerates the portfolio
+   from its seed and must reproduce its digest; it never sees policy.
+3. Local: every assignment re-verified (eligible rail, mask respected, liquidity and capacity
+   respected, maximal: nothing unserved still fits), and every metric recomputed from the
+   assignments. A failing result is discarded and recomputed locally, visibly.
+
+Measured on 2026-09-19 (Windows laptop client): Modal cold 13.8 s, warm about 1.4 s, local
+0.4 s for the same 5 scenarios; results identical. At this size Modal demonstrates the
+architecture (parallel, verified, policy-blind workers), not a speed-up.
+
+```bash
+uv run python scripts/evidence_smoke.py                  # LIVE: both incidents via Gateway
+uv run modal deploy -m sikarescue.compute.modal_app      # adds allocate_outage_scenario
+```
+

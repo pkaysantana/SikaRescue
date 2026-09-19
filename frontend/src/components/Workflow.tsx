@@ -2,10 +2,12 @@ import type { Ref } from "react";
 
 import { accountName, clock, grouped, stateName } from "../format";
 import type { Action, AdviceCard as Advice, DemoView, NextAction, RouteOption } from "../types";
+import { LedgerDiff } from "./ControlPlane";
 
 // ------------------------------------------------------------------ stepper
 
 const STEPS: { key: NextAction; label: string }[] = [
+  { key: "classify", label: "Classify" },
   { key: "analyse", label: "Analyse" },
   { key: "approve", label: "Approve" },
   { key: "execute", label: "Execute" },
@@ -324,6 +326,7 @@ export function PlanApproval({ view, pending, onApprove, sectionRef }: PlanProps
           </ul>
         </details>
       </div>
+      <LedgerDiff preview={view.preview} />
       {approval ? (
         <p className="done-note">
           ✓ Approved by <span className="mono">{approval.approver}</span> (unauthenticated demo

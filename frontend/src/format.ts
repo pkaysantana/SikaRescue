@@ -18,6 +18,8 @@ const ACCOUNTS: Record<string, string> = {
 
 export const accountName = (code: string) => ACCOUNTS[code] ?? code;
 
+export const sentence = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
+
 const STATES: Record<string, string> = {
   FAILED: "Failed",
   DIAGNOSING: "Diagnosing",

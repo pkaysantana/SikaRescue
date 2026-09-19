@@ -13,7 +13,14 @@ from typing import Annotated, Literal
 
 from pydantic import Field, StringConstraints, model_validator
 
-from sikarescue.models.common import DomainModel, EntityId, FxRate, Money, TransactionId
+from sikarescue.models.common import (
+    DomainModel,
+    EntityId,
+    FxRate,
+    Money,
+    Sha256Hex,
+    TransactionId,
+)
 from sikarescue.models.enums import (
     EFFECT_KEY_SUFFIX,
     OPERATION_FLOW,
@@ -161,6 +168,33 @@ class ProviderCallbackRecorded(DomainModel):
     note: ProviderText
 
 
+class ProviderResponseReceived(DomainModel):
+    """A dispatched attempt came back with a response that is NOT yet classified.
+
+    Until a verdict is recorded, the attempt's outcome is unknown to the journal and no
+    further value may move (see `diagnosis`).
+    """
+
+    kind: Literal["provider_response_received"] = "provider_response_received"
+    incident_id: EntityId
+    rail_id: RailId
+    attempt_id: EntityId
+    operation: OperationType
+    raw_payload_digest: Sha256Hex
+    response_received: bool
+    http_status: int | None = Field(default=None, ge=100, le=599)
+
+
+class FailureEvidenceVerified(DomainModel):
+    """The deterministic verifier's classification of an incident (write-once)."""
+
+    kind: Literal["failure_evidence_verified"] = "failure_evidence_verified"
+    incident_id: EntityId
+    attempt_id: EntityId
+    evidence_digest: Sha256Hex
+    classification: AttemptOutcome
+
+
 class ReconciliationCompleted(DomainModel):
     kind: Literal["reconciliation_completed"] = "reconciliation_completed"
     reconciliation_id: EntityId
@@ -172,6 +206,8 @@ JournalBody = Annotated[
     | ExecutionStarted
     | ExecutionFinished
     | ProviderCallbackRecorded
+    | ProviderResponseReceived
+    | FailureEvidenceVerified
     | ReconciliationCompleted,
     Field(discriminator="kind"),
 ]

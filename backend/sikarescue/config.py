@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     # ~15 s: comfortably above a measured ~10.5 s cold start, short enough for a live demo.
     modal_timeout_seconds: float = Field(default=15.0, gt=0, le=600)
     modal_shards_per_scenario: int = Field(default=2, ge=1, le=16)
+    # Systemic outage analysis (one Modal job per scenario); on breach: local fallback.
+    outage_timeout_seconds: float = Field(default=45.0, gt=0, le=600)
 
     # Pydantic AI advice layer (Phase 5). `deterministic` never calls a model.
     agent_mode: Literal["deterministic", "pydantic"] = "deterministic"

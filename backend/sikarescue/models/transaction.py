@@ -23,6 +23,7 @@ from sikarescue.models.enums import (
     FundsCertainty,
     FundsLocation,
     OperationType,
+    PositionStatus,
     RailId,
     RecoveryState,
     SettlementLegStatus,
@@ -100,6 +101,37 @@ class OutstandingObligation(DomainModel):
     endpoint_type: EndpointType
 
 
+class FundsPosition(DomainModel):
+    """Where the transaction's value was last PROVEN to be, and what may be done with it.
+
+    Derived from the journal (plus in-flight executions and unclassified provider responses);
+    never stored. `last_confirmed_location` is a claim about the journal, not about where the
+    money physically is: while `certainty` is UNCERTAIN it may already have moved on.
+    """
+
+    transaction_id: TransactionId
+    amount: Money  # the value at the last confirmed location
+    last_confirmed_location: FundsLocation
+    position_status: PositionStatus
+    certainty: FundsCertainty
+    available_for_automatic_action: bool
+    derived_from_effect_ids: tuple[str, ...]  # the journal effects that prove the location
+    reason: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> FundsPosition:
+        proven = self.position_status in (PositionStatus.AVAILABLE, PositionStatus.FINAL)
+        if proven != (self.certainty is FundsCertainty.PROVEN):
+            raise ValueError(f"{self.position_status} is inconsistent with {self.certainty}")
+        if self.available_for_automatic_action and (
+            self.position_status is not PositionStatus.AVAILABLE
+        ):
+            raise ValueError("only an AVAILABLE, proven position allows automatic action")
+        if not proven and not self.reason:
+            raise ValueError("an uncertain position must say why")
+        return self
+
+
 class TransactionState(DomainModel):
     """Deterministically derived from the journal. The LLM never owns or edits this."""
 
@@ -118,6 +150,9 @@ class TransactionState(DomainModel):
     funds_certainty: FundsCertainty
     available_for_automatic_action: bool
     uncertainty_reason: str | None = Field(default=None, max_length=200)
+    funds_position: FundsPosition
+    # A dispatched payout whose provider response is not yet classified (see evidence).
+    evidence_pending: bool = False
     failed_leg: RailId | None
     last_payout_outcome: AttemptOutcome | None
     safe_to_restart_from_origin: bool

@@ -53,6 +53,10 @@ class ExecutionConflictError(SikaRescueError):
     pass
 
 
+class EvidencePendingError(SikaRescueError):
+    """A provider response has not been classified yet; nothing may be planned or moved."""
+
+
 class IdempotencyConflictError(SikaRescueError):
     """An idempotency key is already bound to a DIFFERENT request fingerprint: fail closed."""
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from datetime import timedelta
 from typing import NoReturn
 
 from sikarescue import telemetry
@@ -16,11 +17,13 @@ from sikarescue.errors import (
     ApprovalMismatchError,
     ApprovalRequiredError,
     ComputeIntegrityError,
+    EvidencePendingError,
     ExecutionConflictError,
     IdempotencyConflictError,
     IllegalTransitionError,
     ManualReviewRequiredError,
     NoEligibleRouteError,
+    NotFoundError,
     RecoveryPreconditionError,
     StalePlanError,
     StalePlanningResultError,
@@ -36,15 +39,20 @@ from sikarescue.models import (
     DomainModel,
     EligibilitySnapshot,
     EndpointType,
+    EvidenceVerdict,
     ExecutionFinished,
     ExecutionResult,
     ExecutionStarted,
     ExecutionStatus,
     FailureDetail,
+    FailureEvidence,
+    FailureEvidenceVerified,
     FailureStage,
-    FinancialEffect,
+    FinancialEffectGraph,
     FundsLocation,
+    IncidentClassification,
     JournalEntry,
+    LedgerPreview,
     LiquidityStatus,
     OperationAttempt,
     OperationType,
@@ -52,6 +60,8 @@ from sikarescue.models import (
     PlanningSnapshot,
     PlanStatus,
     PolicyDecision,
+    ProviderEvidenceCatalog,
+    ProviderIncident,
     Rail,
     RailId,
     RailQuote,
@@ -60,15 +70,22 @@ from sikarescue.models import (
     ReconciliationResult,
     RecoveryPlan,
     RecoveryState,
+    RetryCounterfactual,
     RouteEvaluation,
     RouteEvaluationBatch,
     RouteEvaluationRequest,
+    SafeActionFrontier,
     SimulationConfig,
     TransactionState,
-    effect_key,
     new_id,
     payout_execution_key,
     utcnow,
+)
+from sikarescue.services.control_plane import (
+    build_effect_graph,
+    build_ledger_preview,
+    build_safe_action_frontier,
+    compare_naive_retry,
 )
 from sikarescue.services.diagnosis import (
     check_recovery_preconditions,
@@ -76,6 +93,8 @@ from sikarescue.services.diagnosis import (
     outstanding_obligation,
     summarise_failure,
 )
+from sikarescue.services.effects import payout_attempt, recipient_credit_effect
+from sikarescue.services.evidence import verify_failure_evidence
 from sikarescue.services.liquidity import LiquidityBook
 from sikarescue.services.payout_gateway import (
     IdempotencyKeyReuseError,
@@ -127,6 +146,7 @@ class RecoveryService:
         compute: RouteComputeBackend,
         simulation_config: SimulationConfig,
         payout_timeout_seconds: float = 30.0,
+        evidence_catalogs: dict[RailId, ProviderEvidenceCatalog] | None = None,
     ):
         self.repository = repository
         self.registry = registry
@@ -136,6 +156,8 @@ class RecoveryService:
         self.compute = compute
         self.simulation_config = simulation_config
         self.payout_timeout_seconds = payout_timeout_seconds
+        # Documented provider result codes. No catalog => nothing can be proven definitive.
+        self.evidence_catalogs = evidence_catalogs or {}
 
     @property
     def compute_backend(self) -> str:
@@ -239,6 +261,73 @@ class RecoveryService:
     def get_journal(self, transaction_id: str) -> tuple[JournalEntry, ...]:
         return self.repository.get(transaction_id).journal.entries
 
+    # ===================================================================== derived views
+    # Pure reads over authoritative state. None of these writes anything.
+
+    def get_effect_graph(self, transaction_id: str) -> FinancialEffectGraph:
+        return build_effect_graph(self.repository.get(transaction_id))
+
+    def _fresh_current_plan(self, aggregate: TransactionAggregate) -> RecoveryPlan | None:
+        plan = aggregate.current_plan
+        if plan is None or aggregate.plan_status[plan.plan_id] not in (
+            PlanStatus.PENDING_APPROVAL,
+            PlanStatus.APPROVED,
+        ):
+            return None
+        return None if self._staleness(aggregate, plan) else plan
+
+    def get_safe_action_frontier(self, transaction_id: str) -> SafeActionFrontier:
+        aggregate = self.repository.get(transaction_id)
+        with telemetry.span("safe_frontier_built", transaction_id=transaction_id) as span:
+            plan = self._fresh_current_plan(aggregate)
+            obligation = outstanding_obligation(aggregate)
+            candidates = (
+                discover_candidates(
+                    aggregate, obligation, self.registry, self.policy, self.liquidity
+                )
+                if plan is None and obligation is not None
+                else None
+            )
+            frontier = build_safe_action_frontier(aggregate, plan=plan, candidates=candidates)
+            counts = frontier.counts
+            span.set(
+                basis=frontier.basis,
+                payout_actions_permitted=frontier.payout_actions_permitted,
+                position_status=frontier.funds_position.position_status.value,
+                candidates=counts.candidates,
+                rejected_before_simulation=counts.rejected_before_simulation,
+                eligible=counts.eligible,
+                selected=counts.selected,
+                actions=",".join(a.kind.value for a in frontier.actions),
+            )
+            return frontier
+
+    def preview_recovery(self, plan_id: str) -> LedgerPreview:
+        """CURRENT vs PROPOSED ledger for this plan. Invalid (no projection) if stale."""
+        aggregate, plan = self.repository.get_by_plan(plan_id)
+        with telemetry.span(
+            "recovery_preview_created", transaction_id=plan.transaction_id, plan_id=plan_id
+        ) as span:
+            blockers: list[str] = []
+            status = aggregate.plan_status[plan_id]
+            if aggregate.current_plan_id != plan_id:
+                blockers.append("a newer plan supersedes this one")
+            if status not in (PlanStatus.PENDING_APPROVAL, PlanStatus.APPROVED):
+                blockers.append(f"plan is {status}; only a pending or approved plan previews")
+            if not blockers:
+                blockers = self._staleness(aggregate, plan)  # read-only: nothing is marked
+            preview = build_ledger_preview(aggregate, plan, blockers)
+            span.set(
+                valid=preview.valid,
+                invalidation_reasons="; ".join(preview.invalidation_reasons)[:300] or None,
+                changed_rows=sum(c.changed for c in preview.changes),
+            )
+            return preview
+
+    def compare_naive_retry(self, transaction_id: str) -> RetryCounterfactual:
+        aggregate = self.repository.get(transaction_id)
+        return compare_naive_retry(aggregate, self._fresh_current_plan(aggregate))
+
     # ===================================================================== planning
 
     async def create_recovery_plan(self, transaction_id: str) -> RecoveryPlan:
@@ -305,6 +394,122 @@ class RecoveryService:
                 fallback_reason=fallback_reason[:200] if fallback_reason else None,
             )
 
+    # ===================================================================== evidence
+
+    async def classify_provider_incident(
+        self, transaction_id: str, evidence: FailureEvidence
+    ) -> IncidentClassification:
+        """Record a dispatched attempt's outcome from VERIFIED evidence. Write-once.
+
+        `evidence` may have been extracted by a model; the classification never is. The
+        deterministic verifier decides it from the raw payload, our own transport
+        observations and the provider's documented codes, and fails closed to UNKNOWN.
+        A SUCCEEDED verdict is recorded as UNKNOWN (manual booking), so no recipient credit
+        is ever booked from extracted evidence, and nothing here moves value.
+        """
+        aggregate = self.repository.get(transaction_id)
+        async with aggregate.lock:
+            if aggregate.incident_classification is not None:
+                return aggregate.incident_classification  # write-once: idempotent replay
+            incident = aggregate.incident
+            if incident is None:
+                raise NotFoundError(f"{transaction_id} has no provider incident to classify")
+            if aggregate.state is not RecoveryState.FAILED:
+                raise IllegalTransitionError(f"cannot classify evidence while {aggregate.state}")
+            with telemetry.span(
+                "failure_evidence_verified",
+                transaction_id=transaction_id,
+                incident_id=incident.incident_id,
+                extracted_by=evidence.extracted_by.value,
+            ) as span:
+                verdict = verify_failure_evidence(
+                    incident, evidence, self.evidence_catalogs.get(incident.rail_id)
+                )
+                span.set(
+                    classification=verdict.classification.value,
+                    checks_passed=sum(c.passed for c in verdict.checks),
+                    requirements_passed=sum(r.passed for r in verdict.requirements),
+                    evidence_digest=verdict.evidence_digest[:12],
+                )
+            return self._record_classification(aggregate, incident, evidence, verdict)
+
+    def _record_classification(
+        self,
+        aggregate: TransactionAggregate,
+        incident: ProviderIncident,
+        evidence: FailureEvidence,
+        verdict: EvidenceVerdict,
+    ) -> IncidentClassification:
+        """Caller holds the lock."""
+        definitive = verdict.classification is AttemptOutcome.DEFINITIVE_FAILED
+        recorded = AttemptOutcome.DEFINITIVE_FAILED if definitive else AttemptOutcome.UNKNOWN
+        grounded = all(c.passed for c in verdict.checks)
+        failure = FailureDetail(
+            stage=FailureStage.PRE_ACCEPTANCE if definitive else FailureStage.UNDETERMINED,
+            http_status=incident.http_status,
+            provider_code=evidence.provider_code if grounded else None,
+            message=(
+                f"Verified pre-acceptance rejection: {verdict.catalog_meaning}"
+                if definitive
+                else f"Evidence cannot prove the outcome: {verdict.reasons[0]}"
+            )[:280],
+        )
+        attempt = OperationAttempt(
+            attempt_id=incident.attempt_id,
+            transaction_id=incident.transaction_id,
+            operation=OperationType.RECIPIENT_CREDIT,
+            rail_id=incident.rail_id,
+            source=FundsLocation.GH_SETTLEMENT_ACCOUNT,
+            destination=FundsLocation.RECIPIENT_ENDPOINT,
+            amount=incident.amount,
+            outcome=recorded,
+            idempotency_key=incident.idempotency_key,
+            failure=failure,
+            started_at=incident.dispatched_at,
+            completed_at=incident.dispatched_at + timedelta(milliseconds=incident.elapsed_ms),
+        )
+        aggregate.journal.record_attempt(attempt)
+        aggregate.journal.record(
+            FailureEvidenceVerified(
+                incident_id=incident.incident_id,
+                attempt_id=attempt.attempt_id,
+                evidence_digest=verdict.evidence_digest,
+                classification=verdict.classification,
+            )
+        )
+        classification = IncidentClassification(
+            incident_id=incident.incident_id,
+            evidence=evidence,
+            verdict=verdict,
+            recorded_attempt_id=attempt.attempt_id,
+            recorded_outcome=recorded,
+            classified_at=utcnow(),
+        )
+        aggregate.incident_classification = classification
+        aggregate.record_audit(
+            AuditEventType.FAILURE_EVIDENCE_VERIFIED,
+            ENGINE,
+            f"{incident.rail_id} response classified {verdict.classification} by the "
+            f"deterministic verifier (evidence from {evidence.extracted_by})",
+            incident_id=incident.incident_id,
+            classification=verdict.classification.value,
+            recorded_outcome=recorded.value,
+            extracted_by=evidence.extracted_by.value,
+            evidence_digest=verdict.evidence_digest[:12],
+        )
+        aggregate.transition(
+            RecoveryState.DIAGNOSING,
+            actor=ENGINE,
+            reason=f"provider evidence classified {verdict.classification}",
+        )
+        if recorded is AttemptOutcome.UNKNOWN:
+            self._escalate(
+                aggregate,
+                f"{incident.rail_id} payout outcome UNKNOWN from verified evidence; "
+                "the recipient may already have been credited",
+            )
+        return classification
+
     # Planning runs in three phases so slow (future: remote) compute never holds the lock:
     #   A. under the lock:   capture a PlanningSnapshot       (_capture_planning_snapshot)
     #   B. without the lock: evaluate routes on the snapshot  (_evaluate_snapshot)
@@ -314,6 +519,12 @@ class RecoveryService:
         """Phase A (caller holds the lock). May escalate to MANUAL_REVIEW and raise."""
         if aggregate.state not in PLANNABLE_STATES:
             raise IllegalTransitionError(f"cannot plan recovery while {aggregate.state}")
+        pending = aggregate.journal.pending_provider_responses()
+        if pending:  # refuse without escalating: classification comes first
+            raise EvidencePendingError(
+                f"{pending[0].rail_id} response for attempt {pending[0].attempt_id} is not yet "
+                "classified; classify the provider evidence before planning"
+            )
         if aggregate.state is RecoveryState.FAILED:
             aggregate.transition(
                 RecoveryState.DIAGNOSING,
@@ -995,17 +1206,11 @@ class RecoveryService:
         ):
             raise ExecutionConflictError("execution record changed while payout was in flight")
         now = utcnow()
-        attempt = OperationAttempt(
+        attempt = payout_attempt(
+            plan,
             attempt_id=new_id("att"),
-            transaction_id=plan.transaction_id,
-            operation=OperationType.RECIPIENT_CREDIT,
-            rail_id=plan.rail_id,
-            source=plan.source,
-            destination=FundsLocation.RECIPIENT_ENDPOINT,
-            amount=plan.amount,
+            execution_key=execution.execution_key,
             outcome=response.outcome,
-            idempotency_key=execution.execution_key,
-            plan_id=plan.plan_id,
             provider_reference=response.provider_reference,
             failure=response.failure,
             started_at=execution.started_at,
@@ -1015,18 +1220,7 @@ class RecoveryService:
 
         credit_key: str | None = None
         if response.outcome is AttemptOutcome.SUCCEEDED:
-            effect = FinancialEffect(
-                effect_key=effect_key(plan.transaction_id, OperationType.RECIPIENT_CREDIT),
-                transaction_id=plan.transaction_id,
-                operation=OperationType.RECIPIENT_CREDIT,
-                rail_id=plan.rail_id,
-                attempt_id=attempt.attempt_id,
-                source=plan.source,
-                destination=FundsLocation.RECIPIENT_ENDPOINT,
-                source_amount=plan.amount,
-                destination_amount=plan.amount,
-                posted_at=now,
-            )
+            effect = recipient_credit_effect(plan, attempt_id=attempt.attempt_id, posted_at=now)
             aggregate.journal.post_effect(effect)  # structurally at most once per transaction
             self.liquidity.consume(plan.rail_id, plan.amount)
             credit_key = effect.effect_key

@@ -18,9 +18,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from sikarescue import telemetry
+from sikarescue.api.control_views import OutageView
 from sikarescue.api.session import DemoSession
 from sikarescue.api.views import DemoView, TransactionSummary
 from sikarescue.config import Settings
+from sikarescue.demo_data.incidents import IncidentScenario
 from sikarescue.errors import (
     ComputeIntegrityError,
     NotFoundError,
@@ -31,6 +33,10 @@ from sikarescue.errors import (
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_FRONTEND_DIST = REPO_ROOT / "frontend" / "dist"
+
+
+class ResetRequest(BaseModel):
+    scenario: IncidentScenario | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -112,9 +118,15 @@ def create_app(
         return demo(request).view().transaction
 
     @app.post("/api/demo/reset")
-    async def reset(request: Request) -> DemoView:
-        with telemetry.span("demo_api_reset"):
-            return await demo(request).reset()
+    async def reset(request: Request, body: ResetRequest | None = None) -> DemoView:
+        scenario = body.scenario if body else None
+        with telemetry.span("demo_api_reset", scenario=scenario.value if scenario else None):
+            return await demo(request).reset(scenario)
+
+    @app.post("/api/demo/classify")
+    async def classify(request: Request) -> DemoView:
+        with telemetry.span("demo_api_classify"):
+            return await demo(request).classify()
 
     @app.post("/api/demo/analyse")
     async def analyse(request: Request) -> DemoView:
@@ -130,6 +142,15 @@ def create_app(
     async def execute(request: Request, body: ExecuteRequest) -> DemoView:
         with telemetry.span("demo_api_execute", plan_id=body.plan_id):
             return await demo(request).execute(body.plan_id)
+
+    @app.get("/api/outage")
+    async def outage(request: Request) -> OutageView | None:
+        return demo(request).outage_view()
+
+    @app.post("/api/outage/run")
+    async def run_outage(request: Request) -> OutageView:
+        with telemetry.span("demo_api_outage_run"):
+            return await demo(request).run_outage()
 
     dist = frontend_dist or Path(os.getenv("SIKARESCUE_FRONTEND_DIST", DEFAULT_FRONTEND_DIST))
     if (dist / "index.html").is_file():

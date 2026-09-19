@@ -67,6 +67,15 @@ class FundsCertainty(StrEnum):
     UNCERTAIN = "UNCERTAIN"  # a payout is in flight or UNKNOWN: value may already have moved
 
 
+class PositionStatus(StrEnum):
+    """What may be done with the value at its last confirmed location."""
+
+    AVAILABLE = "AVAILABLE"  # proven in place: automatic recovery may act on it
+    IN_FLIGHT = "IN_FLIGHT"  # a payout is executing, or its response is not yet classified
+    UNCERTAIN = "UNCERTAIN"  # a payout outcome is UNKNOWN: it may already have moved
+    FINAL = "FINAL"  # delivered to the recipient: nothing left to move
+
+
 class OperationType(StrEnum):
     """Logical value-moving operations. Each succeeds at most once per transaction."""
 
@@ -115,6 +124,7 @@ class SettlementLegStatus(StrEnum):
     FAILED = "FAILED"
     UNKNOWN = "UNKNOWN"
     IN_PROGRESS = "IN_PROGRESS"
+    AWAITING_EVIDENCE = "AWAITING_EVIDENCE"  # a response arrived but is not yet classified
 
 
 class RecoveryState(StrEnum):
@@ -206,6 +216,8 @@ class Actor(StrEnum):
 class AuditEventType(StrEnum):
     LEG_SUCCEEDED = "LEG_SUCCEEDED"
     LEG_FAILED = "LEG_FAILED"
+    PROVIDER_RESPONSE_RECEIVED = "PROVIDER_RESPONSE_RECEIVED"
+    FAILURE_EVIDENCE_VERIFIED = "FAILURE_EVIDENCE_VERIFIED"
     PROVIDER_CALLBACK = "PROVIDER_CALLBACK"
     STATE_TRANSITION = "STATE_TRANSITION"
     DIAGNOSIS_COMPLETED = "DIAGNOSIS_COMPLETED"

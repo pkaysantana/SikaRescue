@@ -1,5 +1,8 @@
+import { useState } from "react";
+
 import { accountName } from "../format";
 import type { DemoView, Diagnosis, JourneyLeg } from "../types";
+import { EffectGraph } from "./ControlPlane";
 
 export function PaymentSummary({ view }: { view: DemoView }) {
   const t = view.transaction;
@@ -47,6 +50,7 @@ const STATUS_TEXT: Record<JourneyLeg["status"], string> = {
   FAILED: "Definitive failure",
   UNKNOWN: "Outcome unknown",
   IN_PROGRESS: "In progress",
+  AWAITING_EVIDENCE: "Response not classified yet",
 };
 
 function FundsFlag({ account, diagnosis }: { account: string; diagnosis: Diagnosis }) {
@@ -67,9 +71,31 @@ function FundsFlag({ account, diagnosis }: { account: string; diagnosis: Diagnos
 export function Journey({ view }: { view: DemoView }) {
   const { journey, diagnosis } = view;
   const uncertain = diagnosis.funds_certainty === "UNCERTAIN";
+  const [mode, setMode] = useState<"legs" | "graph">("legs");
   return (
     <section className="journey" aria-labelledby="journey-title">
-      <h2 id="journey-title">Where the money is</h2>
+      <div className="journey-head">
+        <h2 id="journey-title">Where the money is</h2>
+        <div className="segmented" role="group" aria-label="Journey view">
+          <button
+            className={`segment${mode === "legs" ? " segment--on" : ""}`}
+            aria-pressed={mode === "legs"}
+            onClick={() => setMode("legs")}
+          >
+            Journey
+          </button>
+          <button
+            className={`segment${mode === "graph" ? " segment--on" : ""}`}
+            aria-pressed={mode === "graph"}
+            onClick={() => setMode("graph")}
+          >
+            Effect graph
+          </button>
+        </div>
+      </div>
+      {mode === "graph" ? (
+        <EffectGraph view={view} />
+      ) : (
       <ol className="spine">
         {journey.map((leg, i) => (
           <li key={`${leg.rail_id}-${i}`} className={`leg leg--${leg.status.toLowerCase()}`}>
@@ -106,70 +132,21 @@ export function Journey({ view }: { view: DemoView }) {
           </li>
         )}
       </ol>
+      )}
     </section>
   );
 }
 
 export function SafetyNote({ view }: { view: DemoView }) {
   const d = view.diagnosis;
-  if (d.funds_certainty === "UNCERTAIN") {
-    return (
-      <section className="safety safety--uncertain" aria-label="Safety">
-        <p className="safety-lead">
-          The payout outcome is unknown. The recipient may already have been credited.
-        </p>
-        <dl className="safety-facts">
-          <div>
-            <dt>Last confirmed location</dt>
-            <dd className="mono">{d.funds_location}</dd>
-          </div>
-          <div>
-            <dt>Current position certainty</dt>
-            <dd className="mono">{d.funds_certainty}</dd>
-          </div>
-          <div>
-            <dt>Automatic action available</dt>
-            <dd>{d.available_for_automatic_action ? "Yes" : "No"}</dd>
-          </div>
-          <div>
-            <dt>What happens next</dt>
-            <dd>An operator confirms the outcome with the provider. It is never retried automatically.</dd>
-          </div>
-        </dl>
-      </section>
-    );
-  }
-  if (d.recipient_credited) {
-    return (
-      <section className="safety safety--resolved" aria-label="Safety">
-        <p className="safety-lead">The recovery did not charge the sender again.</p>
-        <p className="muted">
-          It continued from where the funds were. The ledger shows {d.sender_debit_count} sender
-          debit.
-        </p>
-      </section>
-    );
-  }
+  if (!d.recipient_credited) return null; // the funds position panel covers the open case
   return (
-    <section className="safety" aria-label="Safety">
-      <p className="safety-lead">Restarting this payment would risk charging the sender twice.</p>
-      <dl className="safety-facts">
-        <div>
-          <dt>Sender debit already recorded</dt>
-          <dd>{d.sender_debited ? `Yes, ${d.sender_debit_count} debit` : "No"}</dd>
-        </div>
-        <div>
-          <dt>Safe to restart from origin</dt>
-          <dd>{d.safe_to_restart_from_origin ? "Yes" : "No"}</dd>
-        </div>
-        <div>
-          <dt>Safe recovery action</dt>
-          <dd>
-            Resume from the current funds location,{" "}
-            <span className="mono">{d.funds_location}</span>
-          </dd>
-        </div>
-      </dl>
+    <section className="safety safety--resolved" aria-label="Safety">
+      <p className="safety-lead">The recovery did not charge the sender again.</p>
+      <p className="muted">
+        It continued from where the funds were. The ledger shows {d.sender_debit_count} sender
+        debit.
+      </p>
     </section>
   );
 }

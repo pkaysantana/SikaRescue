@@ -31,7 +31,7 @@ from sikarescue.models import (
     OperationType,
     utcnow,
 )
-from sikarescue.models.ledger import JournalBody
+from sikarescue.models.ledger import JournalBody, ProviderResponseReceived
 
 
 class FinancialJournal:
@@ -74,6 +74,15 @@ class FinancialJournal:
     def count_effects(self, operation: OperationType) -> int:
         return sum(1 for e in self._effects.values() if e.operation is operation)
 
+    def pending_provider_responses(self) -> tuple[ProviderResponseReceived, ...]:
+        """Provider responses whose attempt has not been classified (recorded) yet."""
+        return tuple(
+            e.body
+            for e in self._entries
+            if isinstance(e.body, ProviderResponseReceived)
+            and e.body.attempt_id not in self._attempts
+        )
+
     def funds_location(self) -> FundsLocation:
         """Replay successful effects from the sender's account. Failed attempts move nothing."""
         location = FundsLocation.SENDER_ACCOUNT
@@ -83,12 +92,29 @@ class FinancialJournal:
             location = effect.destination
         return location
 
+    def fork(self) -> FinancialJournal:
+        """An independent copy for dry runs (previews). Appends to it never touch this one."""
+        clone = FinancialJournal(self.transaction_id, self._clock, principal=self.principal)
+        clone._entries = list(self._entries)  # entries are immutable records
+        clone._effects = dict(self._effects)
+        clone._attempts = dict(self._attempts)
+        return clone
+
     # --- appends -----------------------------------------------------------------------
 
     def record_attempt(self, attempt: OperationAttempt) -> JournalEntry:
         self._require_own(attempt.transaction_id)
         if attempt.attempt_id in self._attempts:
             raise JournalIntegrityError(f"attempt {attempt.attempt_id} already recorded")
+        response = next(
+            (r for r in self.pending_provider_responses() if r.attempt_id == attempt.attempt_id),
+            None,
+        )
+        if response is not None and (response.rail_id, response.operation) != (
+            attempt.rail_id,
+            attempt.operation,
+        ):
+            raise JournalIntegrityError("attempt does not match its recorded provider response")
         self._attempts[attempt.attempt_id] = attempt
         return self._append(AttemptRecorded(attempt=attempt))
 
@@ -139,6 +165,8 @@ class FinancialJournal:
         """Append non-value-moving evidence (execution markers, callbacks, reconciliation)."""
         if isinstance(body, (EffectPosted, AttemptRecorded)):
             raise JournalIntegrityError("use post_effect / record_attempt for financial records")
+        if isinstance(body, ProviderResponseReceived) and body.attempt_id in self._attempts:
+            raise JournalIntegrityError(f"attempt {body.attempt_id} is already classified")
         return self._append(body)
 
     def _append(self, body: JournalBody) -> JournalEntry:

@@ -30,10 +30,20 @@ class PolicyEngine:
         """Demo / test control: simulate a policy change."""
         self._corridor_rail_types = {**self._corridor_rail_types, corridor: rail_types}
 
+    @property
+    def max_payout(self) -> Money:
+        """The per-payout corridor limit enforced by rule POL-003."""
+        return self._max_payout
+
     def check(
         self, transaction: PaymentTransaction, rail: Rail, source: FundsLocation, amount: Money
     ) -> PolicyDecision:
-        corridor = transaction.corridor
+        return self.check_payout(transaction.corridor, rail, source, amount)
+
+    def check_payout(
+        self, corridor: str, rail: Rail, source: FundsLocation, amount: Money
+    ) -> PolicyDecision:
+        """The same rules for one payment or for a fleet of synthetic obligations."""
         allowed = self._corridor_rail_types.get(corridor, frozenset())
         rules = (
             PolicyRuleResult(

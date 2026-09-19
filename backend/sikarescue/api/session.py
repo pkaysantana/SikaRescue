@@ -13,6 +13,11 @@ Reliability rules for live demos:
     instance whose keys reached the provider is never erased and replayed. A reset before any
     dispatch rebuilds the same instance (nothing external ever saw it);
   * the compute backend is kept across resets so Modal stays warm.
+
+Each instance starts from a synthetic MOMO_A provider incident (DEFINITIVE or UNKNOWN). The
+first step classifies it: Pydantic AI extracts FailureEvidence from the raw payload and the
+deterministic verifier decides the outcome. Switching scenario is a reset into a new instance,
+never a mutation of the current one.
 """
 
 from __future__ import annotations
@@ -21,13 +26,18 @@ import asyncio
 from collections.abc import Callable
 
 from sikarescue.agent.advisor import AdvisorConfig, AdvisoryOutcome, RecoveryAdvisor
+from sikarescue.agent.evidence import EvidenceExtraction, EvidenceExtractor
+from sikarescue.api.control_views import OutageView, build_outage_view
 from sikarescue.api.views import DemoView, build_view
 from sikarescue.compute.backend import RouteComputeBackend, build_compute_backend
 from sikarescue.compute.scenarios import workload_config
 from sikarescue.config import Settings
+from sikarescue.demo_data.incidents import IncidentScenario
+from sikarescue.demo_data.outage import build_outage_analyzer
 from sikarescue.demo_data.sk10421 import DemoWorld, build_demo_world, new_instance_id
 from sikarescue.errors import IdempotencyConflictError, IllegalTransitionError
 from sikarescue.models import ExecutionStatus, RecoveryState
+from sikarescue.models.outage import OutageAnalysis
 from sikarescue.services.payout_gateway import SimulatedPayoutGateway
 
 APPROVER = "demo.operator"  # an unauthenticated demo operator: there is no login or RBAC
@@ -35,6 +45,7 @@ APPROVER = "demo.operator"  # an unauthenticated demo operator: there is no logi
 # (payment instance id, the session's long-lived payout provider) -> a seeded world
 WorldFactory = Callable[[str, SimulatedPayoutGateway], DemoWorld]
 AdvisorFactory = Callable[[DemoWorld], RecoveryAdvisor]
+ExtractorFactory = Callable[[DemoWorld], EvidenceExtractor]
 
 _ANALYSABLE = frozenset(
     {RecoveryState.FAILED, RecoveryState.DIAGNOSING, RecoveryState.RECOVERY_FAILED}
@@ -49,11 +60,18 @@ class DemoSession:
         *,
         world_factory: WorldFactory | None = None,
         advisor_factory: AdvisorFactory | None = None,
+        extractor_factory: ExtractorFactory | None = None,
+        scenario: IncidentScenario = IncidentScenario.DEFINITIVE,
     ) -> None:
         self.settings = settings
         self._compute: RouteComputeBackend | None = None
         self._world_factory = world_factory or self._seeded_world
         self._advisor_factory = advisor_factory or self._configured_advisor
+        self._extractor_factory = extractor_factory or self._configured_extractor
+        self.scenario = scenario
+        self._extraction: EvidenceExtraction | None = None
+        self._outage: OutageAnalysis | None = None
+        self._outage_lock = asyncio.Lock()  # independent of the payment: never blocks it
         self._lock = asyncio.Lock()
         # The external payout provider: it outlives every reset and remembers every key.
         self.gateway = SimulatedPayoutGateway(latency_seconds=settings.payout_latency_seconds)
@@ -75,6 +93,7 @@ class DemoSession:
         return build_demo_world(
             transaction_id=transaction_id,
             gateway=gateway,
+            incident=self.scenario,
             payout_timeout_seconds=settings.payout_timeout_seconds,
             compute=self._compute,
             simulation=workload_config(
@@ -88,6 +107,9 @@ class DemoSession:
         return RecoveryAdvisor(
             world.service, AdvisorConfig.from_settings(self.settings), settings=self.settings
         )
+
+    def _configured_extractor(self, world: DemoWorld) -> EvidenceExtractor:
+        return EvidenceExtractor(AdvisorConfig.from_settings(self.settings), settings=self.settings)
 
     def _dispatched(self, transaction_id: str) -> bool:
         """Has ANY payout request for this instance ever reached the provider?"""
@@ -126,22 +148,52 @@ class DemoSession:
             agent_mode=self.agent_mode,
             resets=self.resets,
             retired_instance_ids=self.retired_instance_ids,
+            scenario=self.scenario,
+            extraction=self._extraction,
         )
 
     # ------------------------------------------------------------------ operations
 
-    async def reset(self) -> DemoView:
+    async def reset(self, scenario: IncidentScenario | None = None) -> DemoView:
         async with self._lock:
             current = self.world.transaction_id
             aggregate = self.world.repository.get(current)
-            if self._dispatched(current) or aggregate.executions:
+            target = scenario or self.scenario
+            # An instance that reached a provider, or whose outcome is UNKNOWN, is retired:
+            # its identity is never erased and replayed.
+            if (
+                self._dispatched(current)
+                or aggregate.executions
+                or aggregate.state is RecoveryState.MANUAL_REVIEW
+            ):
                 self.retired_instance_ids.append(current)
                 instance = new_instance_id()
+            elif target is not self.scenario:
+                instance = new_instance_id()  # a different payment, never a mutated one
             else:
                 instance = current  # nothing reached a provider: rebuilding it is safe
+            self.scenario = target
             self._world = self._build_world(instance)
             self._advisory = None
+            self._extraction = None
             self.resets += 1
+            return self.view()
+
+    async def classify(self) -> DemoView:
+        """Pydantic AI extracts evidence; the deterministic verifier classifies. Idempotent."""
+        async with self._lock:
+            aggregate = self.world.repository.get(self.transaction_id)
+            if aggregate.incident_classification is not None:
+                return self.view()  # write-once: already classified
+            incident = aggregate.incident
+            if incident is None:
+                raise IllegalTransitionError("this payment has no provider incident to classify")
+            extractor = self._extractor_factory(self.world)
+            extraction = await extractor.extract(incident, aggregate.instruction)
+            self._extraction = extraction
+            await self.world.service.classify_provider_incident(
+                self.transaction_id, extraction.evidence
+            )
             return self.view()
 
     async def analyse(self) -> DemoView:
@@ -178,3 +230,22 @@ class DemoSession:
                 if execution.status is ExecutionStatus.SUCCEEDED:
                     await self.world.service.reconcile_transaction(self.transaction_id)
             return self.view()
+
+    # ------------------------------------------------------------------ systemic outage
+
+    def outage_view(self) -> OutageView | None:
+        if self._outage is None:
+            return None
+        names = {r.rail_id: r.display_name.replace("->", "→") for r in self.world.registry.all()}
+        return build_outage_view(self._outage, names)
+
+    async def run_outage(self) -> OutageView:
+        async with self._outage_lock:
+            settings = self.settings
+            analyzer = build_outage_analyzer(
+                settings.compute_backend, timeout_seconds=settings.outage_timeout_seconds
+            )
+            self._outage = await analyzer.run()
+            view = self.outage_view()
+            assert view is not None
+            return view

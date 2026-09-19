@@ -16,6 +16,8 @@ from pydantic_ai import ModelResponse
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from sikarescue.agent.advisor import AdvisorConfig
+from sikarescue.agent.evidence import EvidenceExtractor
 from sikarescue.api.app import create_app
 from sikarescue.api.session import DemoSession
 from sikarescue.compute.backend import (
@@ -33,7 +35,7 @@ from sikarescue.demo_data.sk10421 import (
 from sikarescue.errors import IdempotencyConflictError
 from sikarescue.models import AttemptOutcome, AuditEventType, OperationType, RailId
 
-from helpers import pydantic_advisor, scripted_model
+from helpers import extraction_for, pydantic_advisor, scripted_extraction, scripted_model
 
 SETTINGS = Settings(
     _env_file=None, compute_backend="local", agent_mode="deterministic", payout_latency_seconds=0
@@ -47,8 +49,20 @@ class DownModal(RouteComputeBackend):
         raise ConnectionError("modal unreachable")
 
 
+def _scripted_extractor(world):
+    """A stand-in for the extraction model that reports this incident honestly."""
+    return EvidenceExtractor(
+        AdvisorConfig(mode="pydantic"), model=scripted_extraction(extraction_for(world))
+    )
+
+
+def _session(**kwargs) -> DemoSession:
+    kwargs.setdefault("extractor_factory", _scripted_extractor)
+    return DemoSession(SETTINGS, **kwargs)
+
+
 def _client(session: DemoSession | None = None) -> httpx.AsyncClient:
-    app = create_app(SETTINGS, session=session or DemoSession(SETTINGS), configure_telemetry=False)
+    app = create_app(SETTINGS, session=session or _session(), configure_telemetry=False)
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://demo")
 
 
@@ -58,7 +72,16 @@ async def client():
         yield c
 
 
+async def _classify(c: httpx.AsyncClient) -> dict:
+    response = await c.post("/api/demo/classify")
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 async def _analyse(c: httpx.AsyncClient) -> dict:
+    """Classify the provider evidence first when the payment still needs it, then analyse."""
+    if (await c.get("/api/demo/status")).json()["next_action"] == "classify":
+        await _classify(c)
     response = await c.post("/api/demo/analyse")
     assert response.status_code == 200, response.text
     return response.json()
@@ -83,7 +106,7 @@ async def test_health(client):
 
 async def test_initial_view_is_the_seeded_failure(client):
     view = (await client.get("/api/demo/status")).json()
-    assert view["state"] == "FAILED" and view["next_action"] == "analyse"
+    assert view["state"] == "FAILED" and view["next_action"] == "classify"
     assert view["transaction"] == {
         "scenario_id": "SK-10421",
         "payment_instance_id": view["transaction"]["payment_instance_id"],
@@ -100,10 +123,14 @@ async def test_initial_view_is_the_seeded_failure(client):
         ("Sender debit", "SUCCESS", False),
         ("GBP → GHS FX", "SUCCESS", False),
         ("Ghana settlement", "SUCCESS", True),
-        ("Payout", "FAILED", False),
+        ("Payout", "AWAITING_EVIDENCE", False),  # the response is not classified yet
     ]
     diagnosis = view["diagnosis"]
     assert diagnosis["funds_location"] == "GH_SETTLEMENT_ACCOUNT"
+    assert diagnosis["funds_label"] == "Last confirmed here"  # unproven until classified
+    assert view["funds_position"]["position_status"] == "IN_FLIGHT"
+    assert view["frontier"]["basis"] == "PENDING_EVIDENCE"
+    assert view["incident"]["verdict"] is None and view["scenario"]["current"] == "definitive"
     assert diagnosis["sender_debited"] and diagnosis["sender_debit_count"] == 1
     assert diagnosis["safe_to_restart_from_origin"] is False
     assert view["analysis"] is None and view["payout_calls"] == 0
@@ -160,8 +187,10 @@ async def test_full_flow_reconciles_with_exactly_one_debit_and_credit(client):
 
 
 async def test_double_clicks_never_duplicate_work():
-    session = DemoSession(SETTINGS)
+    session = _session()
     async with _client(session) as c:
+        classified = await asyncio.gather(*(c.post("/api/demo/classify") for _ in range(2)))
+        assert [r.status_code for r in classified] == [200, 200]  # classification is write-once
         first, second = await asyncio.gather(
             c.post("/api/demo/analyse"), c.post("/api/demo/analyse")
         )
@@ -203,7 +232,7 @@ async def test_wrong_hash_and_premature_execution_are_refused(client):
 
 
 async def test_reset_restores_the_seed_and_a_second_run_works():
-    session = DemoSession(SETTINGS)
+    session = _session()
     async with _client(session) as c:
         await _run_to_reconciled(c)
         again = await c.post("/api/demo/analyse")
@@ -224,7 +253,7 @@ async def test_reset_restores_the_seed_and_a_second_run_works():
 
 
 async def test_reset_after_dispatch_starts_a_new_payment_instance():
-    session = DemoSession(SETTINGS)
+    session = _session()
     async with _client(session) as c:
         first = await _run_to_reconciled(c)
         instance_a = first["transaction"]["payment_instance_id"]
@@ -254,7 +283,7 @@ async def test_reset_after_dispatch_starts_a_new_payment_instance():
 
 
 async def test_reset_before_any_dispatch_rebuilds_the_same_instance():
-    session = DemoSession(SETTINGS)
+    session = _session()
     async with _client(session) as c:
         plan = (await _analyse(c))["analysis"]["plan"]
         body = {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"]}
@@ -267,7 +296,7 @@ async def test_reset_before_any_dispatch_rebuilds_the_same_instance():
 
 
 async def test_recovery_failed_can_be_analysed_again_and_recovers():
-    session = DemoSession(SETTINGS)
+    session = _session()
     session.gateway.script(RailId.MOMO_B, AttemptOutcome.DEFINITIVE_FAILED)
     async with _client(session) as c:
         failed = await _run_to_reconciled(c)
@@ -287,7 +316,7 @@ async def test_recovery_failed_can_be_analysed_again_and_recovers():
 
 
 async def test_stale_replacement_is_never_stranded_without_a_plan():
-    session = DemoSession(SETTINGS)
+    session = _session()
     async with _client(session) as c:
         plan = (await _analyse(c))["analysis"]["plan"]
         body = {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"]}
@@ -319,7 +348,7 @@ async def test_stale_replacement_is_never_stranded_without_a_plan():
 
 
 async def test_unknown_payout_shows_last_confirmed_location_and_requires_review():
-    session = DemoSession(SETTINGS)
+    session = _session()
     session.gateway.script(RailId.MOMO_B, AttemptOutcome.UNKNOWN)
     async with _client(session) as c:
         view = await _run_to_reconciled(c)
@@ -340,16 +369,14 @@ async def test_unknown_payout_shows_last_confirmed_location_and_requires_review(
 
         reset = (await c.post("/api/demo/reset")).json()  # dispatched, so a new instance
         assert reset["retired_instance_ids"] == [view["transaction"]["payment_instance_id"]]
-        assert reset["diagnosis"]["funds_label"] == "Funds are here"
+        assert reset["next_action"] == "classify"  # a fresh, still-unclassified incident
 
 
 async def test_ai_fallback_is_labelled_and_unused_model_fields_are_hidden():
     def broken(messages, info: AgentInfo) -> ModelResponse:
         raise ModelHTTPError(status_code=503, model_name="gemini", body=None)
 
-    session = DemoSession(
-        SETTINGS, advisor_factory=lambda world: pydantic_advisor(world, FunctionModel(broken))
-    )
+    session = _session(advisor_factory=lambda world: pydantic_advisor(world, FunctionModel(broken)))
     async with _client(session) as c:
         advice = (await _analyse(c))["analysis"]["advice"]
         assert advice["orchestrator"] == "deterministic_fallback" and advice["ai_used"] is False
@@ -361,8 +388,7 @@ async def test_ai_fallback_is_labelled_and_unused_model_fields_are_hidden():
 
 
 async def test_ai_advice_shows_genuine_model_fields():
-    session = DemoSession(
-        SETTINGS,
+    session = _session(
         advisor_factory=lambda world: pydantic_advisor(
             world, scripted_model(transaction_id=world.transaction_id)
         ),
@@ -377,8 +403,7 @@ async def test_ai_advice_shows_genuine_model_fields():
 
 async def test_modal_fallback_is_reported_truthfully():
     compute = FallbackComputeBackend(DownModal(), LocalRouteComputeBackend())
-    session = DemoSession(
-        SETTINGS,
+    session = _session(
         world_factory=lambda txn, gateway: build_demo_world(
             transaction_id=txn, gateway=gateway, compute=compute
         ),

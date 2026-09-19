@@ -20,8 +20,10 @@ from sikarescue.models import (
     AuditEventType,
     ExecutionResult,
     ExecutionStatus,
+    IncidentClassification,
     PaymentTransaction,
     PlanStatus,
+    ProviderIncident,
     ReconciliationResult,
     RecoveryPlan,
     RecoveryState,
@@ -46,6 +48,9 @@ class TransactionAggregate:
     # Keyed by the attempt-level execution key `{txn}:plan:{plan_id}:payout`.
     executions: dict[str, ExecutionResult] = field(default_factory=dict)
     reconciliation: ReconciliationResult | None = None
+    # The original payout's raw provider response, while/after it is classified.
+    incident: ProviderIncident | None = None
+    incident_classification: IncidentClassification | None = None
     audit: list[AuditEvent] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

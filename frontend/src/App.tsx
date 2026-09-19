@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ApiError, api } from "./api";
-import { PaymentSummary, Journey, SafetyNote } from "./components/Truth";
+import { FrontierPanel, FundsPositionPanel, RetryPanel } from "./components/ControlPlane";
+import { EvidencePanel, ScenarioSwitch } from "./components/Evidence";
+import { OutagePanel } from "./components/Outage";
+import { Journey, PaymentSummary, SafetyNote } from "./components/Truth";
 import {
   AdviceCard,
   AnalyseStep,
@@ -13,13 +16,14 @@ import {
   Spinner,
   Stepper,
 } from "./components/Workflow";
-import type { Action, DemoView, RecoveryState } from "./types";
+import type { Action, DemoView, OutageView, RecoveryState } from "./types";
 
-type Focus = "routes" | "execute" | "proof" | "top";
+type Focus = "evidence" | "frontier" | "routes" | "execute" | "proof" | "top";
+type Tab = "payment" | "outage";
 
 const BADGES: Record<RecoveryState, { text: string; tone: string }> = {
   FAILED: { text: "FAILED", tone: "bad" },
-  DIAGNOSING: { text: "ANALYSING", tone: "busy" },
+  DIAGNOSING: { text: "DIAGNOSING", tone: "busy" },
   AWAITING_APPROVAL: { text: "AWAITING APPROVAL", tone: "wait" },
   APPROVED: { text: "APPROVED", tone: "wait" },
   RECOVERY_EXECUTING: { text: "EXECUTING", tone: "busy" },
@@ -31,12 +35,13 @@ const BADGES: Record<RecoveryState, { text: string; tone: string }> = {
 
 function StatusBadge({ state, pending }: { state: RecoveryState; pending: Action | null }) {
   // While a request runs, say what is happening; otherwise show the backend's state.
-  const badge =
-    pending === "analyse"
-      ? { text: "ANALYSING", tone: "busy" }
-      : pending === "execute"
-        ? { text: "EXECUTING", tone: "busy" }
-        : BADGES[state];
+  const busy: Partial<Record<Action, string>> = {
+    classify: "CLASSIFYING",
+    analyse: "ANALYSING",
+    execute: "EXECUTING",
+  };
+  const text = pending ? busy[pending] : undefined;
+  const badge = text ? { text, tone: "busy" } : BADGES[state];
   return (
     <span className={`badge badge--${badge.tone}`} role="status" aria-live="polite">
       {badge.text}
@@ -49,10 +54,21 @@ const prefersReducedMotion = () =>
 
 export default function App() {
   const [view, setView] = useState<DemoView | null>(null);
+  const [outage, setOutage] = useState<OutageView | null>(null);
+  // `#outage` opens the fleet view directly (bookmarkable, and handy for recordings).
+  const [tab, setTabState] = useState<Tab>(() =>
+    window.location.hash === "#outage" ? "outage" : "payment",
+  );
+  const setTab = (next: Tab) => {
+    setTabState(next);
+    window.history.replaceState(null, "", next === "outage" ? "#outage" : "#");
+  };
   const [pending, setPending] = useState<Action | null>("load");
   const [error, setError] = useState<{ message: string; code: string } | null>(null);
   const [focus, setFocus] = useState<Focus | null>(null);
   const inFlight = useRef(false);
+  const evidenceRef = useRef<HTMLElement>(null);
+  const frontierRef = useRef<HTMLElement>(null);
   const routesRef = useRef<HTMLElement>(null);
   const executeRef = useRef<HTMLElement>(null);
   const proofRef = useRef<HTMLElement>(null);
@@ -88,9 +104,12 @@ export default function App() {
   useEffect(() => {
     // Initial load: state is only set from the async callbacks, never synchronously here.
     let active = true;
-    api
-      .status()
-      .then((v) => active && setView(v))
+    Promise.all([api.status(), api.outage()])
+      .then(([v, o]) => {
+        if (!active) return;
+        setView(v);
+        setOutage(o);
+      })
       .catch((e) => active && showError(e))
       .finally(() => active && setPending(null));
     return () => {
@@ -103,31 +122,72 @@ export default function App() {
     const behavior: ScrollBehavior = prefersReducedMotion() ? "auto" : "smooth";
     if (focus === "top") window.scrollTo({ top: 0, behavior });
     else {
-      const target = { routes: routesRef, execute: executeRef, proof: proofRef }[focus].current;
-      target?.scrollIntoView({ behavior, block: "start" });
+      const refs = {
+        evidence: evidenceRef,
+        frontier: frontierRef,
+        routes: routesRef,
+        execute: executeRef,
+        proof: proofRef,
+      };
+      refs[focus].current?.scrollIntoView({ behavior, block: "start" });
     }
   }, [focus, view]);
 
   const plan = view?.analysis?.plan;
-  const reset = () => run("reset", api.reset, "top");
+  const reset = () => run("reset", () => api.reset(), "top");
+  const switchScenario = (scenario: string) => run("reset", () => api.reset(scenario), "top");
+  const classify = () => run("classify", api.classify, "frontier");
   const analyse = () => run("analyse", api.analyse, "routes");
   const approve = () => plan && run("approve", () => api.approve(plan.plan_id, plan.plan_hash), "execute");
   const execute = () => plan && run("execute", () => api.execute(plan.plan_id), "proof");
+
+  async function runOutage() {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setPending("outage");
+    setError(null);
+    try {
+      setOutage(await api.runOutage());
+    } catch (e) {
+      showError(e);
+    } finally {
+      inFlight.current = false;
+      setPending(null);
+    }
+  }
+
+  const showAnalyse = view && (view.frontier.payout_actions_permitted || view.analysis !== null);
 
   return (
     <>
       <header className="topbar">
         <div className="brand">
           <span className="wordmark">SikaRescue</span>
-          <span className="tagline">
-            Agentic failed-payment recovery without double charging the sender.
-          </span>
+          <span className="tagline">Recovery control plane for cross-border payouts</span>
         </div>
-        <div className="topbar-actions">
-          {view && <StatusBadge state={view.state} pending={pending} />}
-          <button className="ghost" onClick={reset} disabled={pending !== null || !view}>
-            {pending === "reset" ? <Spinner label="Resetting" /> : "Reset demo"}
+        <nav className="tabs" aria-label="View">
+          <button
+            className={`tab${tab === "payment" ? " tab--on" : ""}`}
+            aria-pressed={tab === "payment"}
+            onClick={() => setTab("payment")}
+          >
+            Payment recovery
           </button>
+          <button
+            className={`tab${tab === "outage" ? " tab--on" : ""}`}
+            aria-pressed={tab === "outage"}
+            onClick={() => setTab("outage")}
+          >
+            Rail outage
+          </button>
+        </nav>
+        <div className="topbar-actions">
+          {view && tab === "payment" && <StatusBadge state={view.state} pending={pending} />}
+          {tab === "payment" && (
+            <button className="ghost" onClick={reset} disabled={pending !== null || !view}>
+              {pending === "reset" ? <Spinner label="Resetting" /> : "Reset demo"}
+            </button>
+          )}
         </div>
       </header>
 
@@ -142,7 +202,14 @@ export default function App() {
         </div>
       )}
 
-      {!view ? (
+      {tab === "outage" ? (
+        <OutagePanel
+          outage={outage}
+          running={pending === "outage"}
+          disabled={pending !== null}
+          onRun={runOutage}
+        />
+      ) : !view ? (
         <main className="loading">
           {pending === "load" ? <Spinner label="Loading SK-10421" /> : "No data from the API yet."}
         </main>
@@ -151,18 +218,28 @@ export default function App() {
           <aside className="truth">
             <PaymentSummary view={view} />
             <Journey view={view} />
+            <FundsPositionPanel view={view} />
             <SafetyNote view={view} />
             <p className="synthetic">Synthetic demo data: no real money, rails, providers or people.</p>
           </aside>
 
           <div className="workflow">
+            <ScenarioSwitch view={view} pending={pending} onSwitch={switchScenario} />
             <Stepper next={view.next_action} />
             {view.notice && (
               <p className="flow-notice" role="status">
                 {view.notice}
               </p>
             )}
-            <AnalyseStep view={view} pending={pending} onAnalyse={analyse} />
+            <EvidencePanel
+              view={view}
+              pending={pending}
+              onClassify={classify}
+              sectionRef={evidenceRef}
+            />
+            <FrontierPanel view={view} sectionRef={frontierRef} />
+            <RetryPanel view={view} />
+            {showAnalyse && <AnalyseStep view={view} pending={pending} onAnalyse={analyse} />}
             <RouteList view={view} sectionRef={routesRef} />
             <ComputePanel view={view} />
             {view.analysis && <AdviceCard advice={view.analysis.advice} />}

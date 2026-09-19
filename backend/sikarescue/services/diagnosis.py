@@ -8,14 +8,17 @@ from sikarescue.models import (
     FailureDetail,
     FundsCertainty,
     FundsLocation,
+    FundsPosition,
     OperationType,
     OutstandingObligation,
+    PositionStatus,
     RecoveryPlan,
     SettlementLeg,
     SettlementLegStatus,
     TransactionState,
     effect_key,
 )
+from sikarescue.models.enums import OPERATION_FLOW
 from sikarescue.services.repository import TransactionAggregate
 
 UPSTREAM_OPERATIONS = (
@@ -66,6 +69,21 @@ def derive_legs(aggregate: TransactionAggregate) -> tuple[SettlementLeg, ...]:
         )
         for i, a in enumerate(aggregate.journal.attempts(), start=1)
     ]
+    for response in aggregate.journal.pending_provider_responses():
+        source, destination = OPERATION_FLOW[response.operation]
+        legs.append(
+            SettlementLeg(
+                sequence=len(legs) + 1,
+                rail_id=response.rail_id,
+                operation=response.operation,
+                source=source,
+                destination=destination,
+                status=SettlementLegStatus.AWAITING_EVIDENCE,
+                attempt_id=response.attempt_id,
+                is_recovery=response.rail_id not in original,
+                failure_summary="provider response received; not yet classified",
+            )
+        )
     for execution in aggregate.executions.values():
         if execution.status is ExecutionStatus.IN_PROGRESS:
             plan = aggregate.plans[execution.plan_id]
@@ -105,6 +123,41 @@ def outstanding_obligation(aggregate: TransactionAggregate) -> OutstandingObliga
     )
 
 
+IN_FLIGHT_REASON = "a payout is in flight; its outcome is not yet known"
+UNCLASSIFIED_REASON = (
+    "a payout response is not yet classified; the recipient may already have been credited"
+)
+UNKNOWN_REASON = "a payout outcome is UNKNOWN; the recipient may already have been credited"
+
+
+def derive_funds_position(aggregate: TransactionAggregate) -> FundsPosition:
+    """The one derivation of funds certainty. Never stored, never edited."""
+    journal = aggregate.journal
+    effects = journal.effects()
+    if journal.has_effect(OperationType.RECIPIENT_CREDIT):
+        status, reason = PositionStatus.FINAL, None
+    elif aggregate.has_execution_in_progress():
+        status, reason = PositionStatus.IN_FLIGHT, IN_FLIGHT_REASON
+    elif journal.pending_provider_responses():
+        status, reason = PositionStatus.IN_FLIGHT, UNCLASSIFIED_REASON
+    elif unresolved_unknown_attempts(aggregate):
+        status, reason = PositionStatus.UNCERTAIN, UNKNOWN_REASON
+    else:
+        status, reason = PositionStatus.AVAILABLE, None
+    proven = status in (PositionStatus.AVAILABLE, PositionStatus.FINAL)
+    return FundsPosition(
+        transaction_id=aggregate.transaction_id,
+        amount=effects[-1].destination_amount if effects else aggregate.instruction.send_amount,
+        last_confirmed_location=journal.funds_location(),
+        position_status=status,
+        certainty=FundsCertainty.PROVEN if proven else FundsCertainty.UNCERTAIN,
+        available_for_automatic_action=status is PositionStatus.AVAILABLE
+        and outstanding_obligation(aggregate) is not None,
+        derived_from_effect_ids=tuple(e.effect_key for e in effects),
+        reason=reason,
+    )
+
+
 def derive_state(aggregate: TransactionAggregate) -> TransactionState:
     journal = aggregate.journal
     payout_attempts = [
@@ -121,13 +174,7 @@ def derive_state(aggregate: TransactionAggregate) -> TransactionState:
     )
     obligation = outstanding_obligation(aggregate)
     unknown = unresolved_unknown_attempts(aggregate)
-    if aggregate.has_execution_in_progress():
-        uncertainty = "a payout is in flight; its outcome is not yet known"
-    elif unknown:
-        uncertainty = "a payout outcome is UNKNOWN; the recipient may already have been credited"
-    else:
-        uncertainty = None
-    certainty = FundsCertainty.UNCERTAIN if uncertainty else FundsCertainty.PROVEN
+    position = derive_funds_position(aggregate)
     return TransactionState(
         transaction_id=aggregate.transaction_id,
         revision=aggregate.revision,
@@ -138,11 +185,12 @@ def derive_state(aggregate: TransactionAggregate) -> TransactionState:
         recipient_credited=recipient_credited,
         sender_debit_count=journal.count_effects(OperationType.SENDER_DEBIT),
         recipient_credit_count=journal.count_effects(OperationType.RECIPIENT_CREDIT),
-        funds_location=journal.funds_location(),
-        funds_certainty=certainty,
-        available_for_automatic_action=certainty is FundsCertainty.PROVEN
-        and obligation is not None,
-        uncertainty_reason=uncertainty,
+        funds_location=position.last_confirmed_location,
+        funds_certainty=position.certainty,
+        available_for_automatic_action=position.available_for_automatic_action,
+        uncertainty_reason=position.reason,
+        funds_position=position,
+        evidence_pending=bool(journal.pending_provider_responses()),
         failed_leg=failed_leg,
         last_payout_outcome=last_payout.outcome if last_payout else None,
         # Once any value has moved, restarting from the origin would double-charge.
@@ -174,6 +222,10 @@ def check_recovery_preconditions(
     unknown = unresolved_unknown_attempts(aggregate)
     if unknown:
         violations.append(f"attempt(s) with UNKNOWN outcome need reconciliation: {unknown}")
+    for response in journal.pending_provider_responses():
+        violations.append(
+            f"{response.rail_id} response for attempt {response.attempt_id} is not yet classified"
+        )
     if plan is not None:
         if plan.transaction_id != aggregate.transaction_id:
             violations.append("plan belongs to another transaction")
