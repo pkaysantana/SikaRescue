@@ -51,7 +51,7 @@ REDACTED = "[REDACTED]"
 DECISION_INVARIANTS = (
     "Never replay a completed value-moving effect: each succeeds at most once per transaction.",
     "The sender is never debited again; recovery continues from where the funds are now.",
-    "Only the outstanding obligation is paid, exactly once, from its current source.",
+    "Only the outstanding obligation is paid, at most once, from its current source.",
     "Only the deterministic plan can execute, and only after a human approves its exact hash.",
 )
 
@@ -81,6 +81,7 @@ def build_model_transaction_view(aggregate: TransactionAggregate) -> ModelTransa
         sender_debited=state.sender_debited,
         recipient_credited=state.recipient_credited,
         funds_location=state.funds_location,
+        funds_certainty=state.funds_certainty,
         failed_leg=state.failed_leg,
         last_payout_outcome=state.last_payout_outcome,
         failure_summary=summarise_failure(last_failed.failure) if last_failed else None,

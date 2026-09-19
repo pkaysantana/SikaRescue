@@ -253,8 +253,9 @@ export function AdviceCard({ advice }: { advice: Advice }) {
         <MetaRow label="Agent tools" value={advice.tool_calls.join(", ") || null} />
       </dl>
       <p className="note">
-        This explanation can't change the plan. The route, amount and fee come from the
-        deterministic planner, and every figure above is checked against it.
+        This explanation can't change the plan. Its structured fields (route, fee, arrival,
+        reliability, reason codes and rejected routes) are checked against the deterministic plan;
+        the narrative wording is not fact-checked. The plan below is what executes.
       </p>
     </section>
   );
@@ -325,7 +326,8 @@ export function PlanApproval({ view, pending, onApprove, sectionRef }: PlanProps
       </div>
       {approval ? (
         <p className="done-note">
-          ✓ Approved by <span className="mono">{approval.approver}</span> at{" "}
+          ✓ Approved by <span className="mono">{approval.approver}</span> (unauthenticated demo
+          operator) at{" "}
           {clock(approval.decided_at)} for hash{" "}
           <span className="mono">{approval.plan_hash_short}</span>
         </p>
@@ -337,8 +339,9 @@ export function PlanApproval({ view, pending, onApprove, sectionRef }: PlanProps
         )
       )}
       <p className="muted small">
-        The approval is bound to this plan's hash and revision. If the route, fee or transaction
-        changes, the plan must be approved again.
+        The approval is bound to this plan's hash and revision. If the route, quote, fee,
+        competing routes or transaction change, the plan goes stale and a new plan needs a new
+        approval.
       </p>
     </section>
   );
@@ -422,7 +425,7 @@ export function ProofPanel({ view, pending, onReset, sectionRef }: ProofProps) {
   const allPassed = r.checks.every((c) => c.passed);
   return (
     <section className="proof" ref={sectionRef} aria-labelledby="proof-title">
-      <h2 id="proof-title">Recovered &amp; reconciled</h2>
+      <h2 id="proof-title">Recovered: internal reconciliation checks passed</h2>
       <table className="ledger">
         <tbody>
           {rows.map((row) => (
@@ -444,8 +447,8 @@ export function ProofPanel({ view, pending, onReset, sectionRef }: ProofProps) {
         {view.payout_calls} payout call, via {plan.rail_name} from{" "}
         <span className="mono">{plan.source}</span>.{" "}
         {allPassed
-          ? `All ${r.checks.length} reconciliation checks passed.`
-          : "Some reconciliation checks failed."}
+          ? `All ${r.checks.length} internal reconciliation checks passed against this demo's own journal.`
+          : "Some internal reconciliation checks failed."}
       </p>
       <button className="secondary" onClick={onReset} disabled={pending !== null}>
         {pending === "reset" ? <Spinner label="Resetting" /> : "Reset demo"}

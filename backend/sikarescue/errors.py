@@ -53,6 +53,10 @@ class ExecutionConflictError(SikaRescueError):
     pass
 
 
+class IdempotencyConflictError(SikaRescueError):
+    """An idempotency key is already bound to a DIFFERENT request fingerprint: fail closed."""
+
+
 class StalePlanError(SikaRescueError):
     """The plan no longer matches reality. It was marked STALE; fresh approval is required."""
 

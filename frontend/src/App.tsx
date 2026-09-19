@@ -157,6 +157,11 @@ export default function App() {
 
           <div className="workflow">
             <Stepper next={view.next_action} />
+            {view.notice && (
+              <p className="flow-notice" role="status">
+                {view.notice}
+              </p>
+            )}
             <AnalyseStep view={view} pending={pending} onAnalyse={analyse} />
             <RouteList view={view} sectionRef={routesRef} />
             <ComputePanel view={view} />

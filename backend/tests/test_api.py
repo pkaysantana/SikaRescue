@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import httpx
 import pytest
@@ -27,10 +28,10 @@ from sikarescue.demo_data.sk10421 import (
     RECIPIENT_NAME,
     RECIPIENT_PHONE,
     RECIPIENT_REFERENCE,
-    TRANSACTION_ID,
     build_demo_world,
 )
-from sikarescue.models import AuditEventType, OperationType
+from sikarescue.errors import IdempotencyConflictError
+from sikarescue.models import AttemptOutcome, AuditEventType, OperationType, RailId
 
 from helpers import pydantic_advisor, scripted_model
 
@@ -84,7 +85,8 @@ async def test_initial_view_is_the_seeded_failure(client):
     view = (await client.get("/api/demo/status")).json()
     assert view["state"] == "FAILED" and view["next_action"] == "analyse"
     assert view["transaction"] == {
-        "transaction_id": "SK-10421",
+        "scenario_id": "SK-10421",
+        "payment_instance_id": view["transaction"]["payment_instance_id"],
         "send_amount": "£120.00",
         "payout_amount": "GHS 1,830.00",
         "fx_rate": "15.25",
@@ -165,7 +167,7 @@ async def test_double_clicks_never_duplicate_work():
         )
         plan = first.json()["analysis"]["plan"]
         assert second.json()["analysis"]["plan"]["plan_id"] == plan["plan_id"]
-        aggregate = session.world.repository.get(TRANSACTION_ID)
+        aggregate = session.world.repository.get(session.transaction_id)
         advice_events = [
             e for e in aggregate.audit if e.event_type is AuditEventType.RECOVERY_ADVICE_GENERATED
         ]
@@ -211,7 +213,7 @@ async def test_reset_restores_the_seed_and_a_second_run_works():
         assert view["state"] == "FAILED" and view["resets"] == 1
         assert view["analysis"] is None and view["reconciliation"] is None
         assert view["diagnosis"]["funds_location"] == "GH_SETTLEMENT_ACCOUNT"
-        journal = session.world.repository.get(TRANSACTION_ID).journal
+        journal = session.world.repository.get(session.transaction_id).journal
         assert len(journal.effects()) == 3  # the seed only: no duplicated effects
         assert journal.count_effects(OperationType.SENDER_DEBIT) == 1
 
@@ -219,6 +221,126 @@ async def test_reset_restores_the_seed_and_a_second_run_works():
         assert second["state"] == "RECONCILED"
         assert second["reconciliation"]["duplicate_sender_debits"] == 0
         assert second["payout_calls"] == 1
+
+
+async def test_reset_after_dispatch_starts_a_new_payment_instance():
+    session = DemoSession(SETTINGS)
+    async with _client(session) as c:
+        first = await _run_to_reconciled(c)
+        instance_a = first["transaction"]["payment_instance_id"]
+        assert first["transaction"]["scenario_id"] == "SK-10421"
+        assert re.fullmatch(r"SK-10421-[0-9a-f]{8}", instance_a)
+        key_a = session.gateway.requests[0].idempotency_key
+        assert key_a.startswith(f"{instance_a}:plan:")
+
+        view = (await c.post("/api/demo/reset")).json()
+        instance_b = view["transaction"]["payment_instance_id"]
+        assert instance_b != instance_a and view["transaction"]["scenario_id"] == "SK-10421"
+        assert view["retired_instance_ids"] == [instance_a]
+        assert view["payout_calls"] == 0  # counted per instance; the provider still remembers A
+
+        second = await _run_to_reconciled(c)
+        assert second["transaction"]["payment_instance_id"] == instance_b
+        assert second["payout_calls"] == 1 and second["state"] == "RECONCILED"
+        requests = session.gateway.requests
+        assert [r.transaction_id for r in requests] == [instance_a, instance_b]
+        assert requests[1].effect_key == f"{instance_b}:recipient_credit"
+        assert requests[1].idempotency_key != key_a
+        assert len(session.gateway.value_movements) == 2  # one credit per instance, no replay
+
+        # Instance A's identity can never be seeded again.
+        with pytest.raises(IdempotencyConflictError, match="retired"):
+            session._build_world(instance_a)
+
+
+async def test_reset_before_any_dispatch_rebuilds_the_same_instance():
+    session = DemoSession(SETTINGS)
+    async with _client(session) as c:
+        plan = (await _analyse(c))["analysis"]["plan"]
+        body = {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"]}
+        instance = (await c.post("/api/demo/approve", json=body)).json()["transaction"]
+        view = (await c.post("/api/demo/reset")).json()
+        assert view["transaction"]["payment_instance_id"] == instance["payment_instance_id"]
+        assert view["retired_instance_ids"] == [] and view["state"] == "FAILED"
+        assert session.gateway.requests == []
+        assert (await _run_to_reconciled(c))["state"] == "RECONCILED"
+
+
+async def test_recovery_failed_can_be_analysed_again_and_recovers():
+    session = DemoSession(SETTINGS)
+    session.gateway.script(RailId.MOMO_B, AttemptOutcome.DEFINITIVE_FAILED)
+    async with _client(session) as c:
+        failed = await _run_to_reconciled(c)
+        assert failed["state"] == "RECOVERY_FAILED" and failed["next_action"] == "analyse"
+        assert "no value moved" in failed["notice"]
+
+        retry = await _analyse(c)
+        plan = retry["analysis"]["plan"]
+        assert retry["state"] == "AWAITING_APPROVAL" and retry["next_action"] == "approve"
+        assert plan["rail_id"] != "MOMO_B"  # the definitively failed rail is excluded
+        body = {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"]}
+        assert (await c.post("/api/demo/approve", json=body)).status_code == 200
+        done = (await c.post("/api/demo/execute", json={"plan_id": plan["plan_id"]})).json()
+        assert done["state"] == "RECONCILED"
+        assert done["diagnosis"]["recipient_credit_count"] == 1
+        assert done["diagnosis"]["sender_debit_count"] == 1
+
+
+async def test_stale_replacement_is_never_stranded_without_a_plan():
+    session = DemoSession(SETTINGS)
+    async with _client(session) as c:
+        plan = (await _analyse(c))["analysis"]["plan"]
+        body = {"plan_id": plan["plan_id"], "plan_hash": plan["plan_hash"]}
+        assert (await c.post("/api/demo/approve", json=body)).status_code == 200
+        registry = session.world.registry
+        quote = registry.quote(RailId.MOMO_B)
+        registry.replace_quote(quote.model_copy(update={"quote_id": "qte_0000000000aa"}))
+
+        stale = await c.post("/api/demo/execute", json={"plan_id": plan["plan_id"]})
+        assert stale.status_code == 409 and stale.json()["error"] == "StalePlanError"
+        replacement = stale.json()["replacement_plan_id"]
+        view = stale.json()["view"]
+        assert view["state"] == "AWAITING_APPROVAL" and view["analysis"] is None
+        assert view["next_action"] == "analyse"  # a visible way forward, never stranded
+        assert "stale" in view["notice"] and replacement in view["notice"]
+        assert view["payout_calls"] == 0
+
+        again = await _analyse(c)
+        new_plan = again["analysis"]["plan"]
+        assert new_plan["plan_id"] == replacement and again["next_action"] == "approve"
+        assert again["approval"] is None and again["notice"] is None  # old approval is void
+        done = await c.post(
+            "/api/demo/approve",
+            json={"plan_id": new_plan["plan_id"], "plan_hash": new_plan["plan_hash"]},
+        )
+        assert done.status_code == 200
+        final = (await c.post("/api/demo/execute", json={"plan_id": new_plan["plan_id"]})).json()
+        assert final["state"] == "RECONCILED" and final["payout_calls"] == 1
+
+
+async def test_unknown_payout_shows_last_confirmed_location_and_requires_review():
+    session = DemoSession(SETTINGS)
+    session.gateway.script(RailId.MOMO_B, AttemptOutcome.UNKNOWN)
+    async with _client(session) as c:
+        view = await _run_to_reconciled(c)
+        diagnosis = view["diagnosis"]
+        assert view["state"] == "MANUAL_REVIEW" and view["next_action"] == "manual_review"
+        assert diagnosis["funds_location"] == "GH_SETTLEMENT_ACCOUNT"
+        assert diagnosis["funds_certainty"] == "UNCERTAIN"
+        assert diagnosis["funds_label"] == "Last confirmed here"
+        assert diagnosis["available_for_automatic_action"] is False
+        assert "may already have been credited" in diagnosis["uncertainty_reason"]
+        assert "never retried automatically" in view["notice"]
+        settlement = next(leg for leg in view["journey"] if leg["label"] == "Ghana settlement")
+        assert settlement["funds_here"]  # the last CONFIRMED location, not a claim of custody
+
+        refused = await c.post("/api/demo/analyse")
+        assert refused.status_code == 409 and refused.json()["view"]["payout_calls"] == 1
+        assert len(session.gateway.requests) == 1  # no automatic retry
+
+        reset = (await c.post("/api/demo/reset")).json()  # dispatched, so a new instance
+        assert reset["retired_instance_ids"] == [view["transaction"]["payment_instance_id"]]
+        assert reset["diagnosis"]["funds_label"] == "Funds are here"
 
 
 async def test_ai_fallback_is_labelled_and_unused_model_fields_are_hidden():
@@ -240,7 +362,10 @@ async def test_ai_fallback_is_labelled_and_unused_model_fields_are_hidden():
 
 async def test_ai_advice_shows_genuine_model_fields():
     session = DemoSession(
-        SETTINGS, advisor_factory=lambda world: pydantic_advisor(world, scripted_model())
+        SETTINGS,
+        advisor_factory=lambda world: pydantic_advisor(
+            world, scripted_model(transaction_id=world.transaction_id)
+        ),
     )
     async with _client(session) as c:
         advice = (await _analyse(c))["analysis"]["advice"]
@@ -252,7 +377,12 @@ async def test_ai_advice_shows_genuine_model_fields():
 
 async def test_modal_fallback_is_reported_truthfully():
     compute = FallbackComputeBackend(DownModal(), LocalRouteComputeBackend())
-    session = DemoSession(SETTINGS, world_factory=lambda: build_demo_world(compute=compute))
+    session = DemoSession(
+        SETTINGS,
+        world_factory=lambda txn, gateway: build_demo_world(
+            transaction_id=txn, gateway=gateway, compute=compute
+        ),
+    )
     async with _client(session) as c:
         summary = (await _analyse(c))["analysis"]["compute"]
         assert summary["configured_backend"] == "modal"

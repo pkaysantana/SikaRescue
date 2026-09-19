@@ -5,7 +5,11 @@ The journal is the single source of truth for value movement. It enforces:
     settlement, at most one recipient credit across every rail and plan);
   * every effect is backed by a recorded SUCCEEDED attempt for the same operation and rail;
   * value moves along the corridor chain in order (an effect's source must be where the
-    funds currently are).
+    funds currently are);
+  * value is conserved between causal effects: each effect consumes exactly the currency and
+    amount the previous effect delivered (FX changes currency only inside its own effect, whose
+    source/destination amounts are checked against its rate), and the first effect consumes
+    exactly the payment's principal when the journal is told it.
 `revision` is the number of entries, so any new financial evidence advances it.
 """
 
@@ -22,6 +26,7 @@ from sikarescue.models import (
     FinancialEffect,
     FundsLocation,
     JournalEntry,
+    Money,
     OperationAttempt,
     OperationType,
     utcnow,
@@ -30,8 +35,15 @@ from sikarescue.models.ledger import JournalBody
 
 
 class FinancialJournal:
-    def __init__(self, transaction_id: str, clock: Callable[[], datetime] = utcnow):
+    def __init__(
+        self,
+        transaction_id: str,
+        clock: Callable[[], datetime] = utcnow,
+        *,
+        principal: Money | None = None,
+    ):
         self.transaction_id = transaction_id
+        self.principal = principal  # what the first effect must consume, when known
         self._clock = clock
         self._entries: list[JournalEntry] = []
         self._effects: dict[str, FinancialEffect] = {}
@@ -98,8 +110,30 @@ class FinancialJournal:
             raise JournalIntegrityError(
                 f"funds are at {self.funds_location()}, not {effect.source}"
             )
+        self._check_value_continuity(effect)
         self._effects[effect.effect_key] = effect
         return self._append(EffectPosted(effect=effect))
+
+    def _check_value_continuity(self, effect: FinancialEffect) -> None:
+        """The effect must consume exactly what the previous causal effect delivered."""
+        previous = next(reversed(self._effects.values()), None)
+        if previous is None:
+            if self.principal is None:
+                return
+            delivered, origin = self.principal, "the payment principal"
+        else:
+            delivered, origin = previous.destination_amount, f"{previous.operation}"
+        consumed = effect.source_amount
+        if consumed.currency is not delivered.currency:
+            raise JournalIntegrityError(
+                f"currency discontinuity: {effect.operation} consumes {consumed.currency} "
+                f"but {origin} delivered {delivered.currency}"
+            )
+        if consumed.amount != delivered.amount:
+            raise JournalIntegrityError(
+                f"amount discontinuity: {effect.operation} consumes {consumed} "
+                f"but {origin} delivered {delivered}"
+            )
 
     def record(self, body: JournalBody) -> JournalEntry:
         """Append non-value-moving evidence (execution markers, callbacks, reconciliation)."""

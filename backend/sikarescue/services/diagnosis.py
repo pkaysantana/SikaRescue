@@ -6,6 +6,7 @@ from sikarescue.models import (
     AttemptOutcome,
     ExecutionStatus,
     FailureDetail,
+    FundsCertainty,
     FundsLocation,
     OperationType,
     OutstandingObligation,
@@ -118,6 +119,15 @@ def derive_state(aggregate: TransactionAggregate) -> TransactionState:
         and not recipient_credited
         else None
     )
+    obligation = outstanding_obligation(aggregate)
+    unknown = unresolved_unknown_attempts(aggregate)
+    if aggregate.has_execution_in_progress():
+        uncertainty = "a payout is in flight; its outcome is not yet known"
+    elif unknown:
+        uncertainty = "a payout outcome is UNKNOWN; the recipient may already have been credited"
+    else:
+        uncertainty = None
+    certainty = FundsCertainty.UNCERTAIN if uncertainty else FundsCertainty.PROVEN
     return TransactionState(
         transaction_id=aggregate.transaction_id,
         revision=aggregate.revision,
@@ -129,12 +139,16 @@ def derive_state(aggregate: TransactionAggregate) -> TransactionState:
         sender_debit_count=journal.count_effects(OperationType.SENDER_DEBIT),
         recipient_credit_count=journal.count_effects(OperationType.RECIPIENT_CREDIT),
         funds_location=journal.funds_location(),
+        funds_certainty=certainty,
+        available_for_automatic_action=certainty is FundsCertainty.PROVEN
+        and obligation is not None,
+        uncertainty_reason=uncertainty,
         failed_leg=failed_leg,
         last_payout_outcome=last_payout.outcome if last_payout else None,
         # Once any value has moved, restarting from the origin would double-charge.
         safe_to_restart_from_origin=not journal.effects(),
-        manual_review_required=bool(unresolved_unknown_attempts(aggregate)),
-        outstanding_obligation=outstanding_obligation(aggregate),
+        manual_review_required=bool(unknown),
+        outstanding_obligation=obligation,
         completed_effect_keys=tuple(e.effect_key for e in journal.effects()),
         legs=derive_legs(aggregate),
     )

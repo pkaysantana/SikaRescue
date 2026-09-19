@@ -47,6 +47,9 @@ HASHED_PLAN_FIELDS = frozenset(
         "incremental_fee",
         "fee_bearer",
         "expected_latency_seconds",
+        "quote_id",
+        "selected_rank",
+        "route_set_fingerprint",
         "eligibility",
         "supersedes_plan_id",
     }
@@ -123,6 +126,11 @@ class RecoveryPlan(DomainModel):
     incremental_fee: Money
     fee_bearer: FeeBearer = FeeBearer.OPERATOR
     expected_latency_seconds: int = Field(gt=0)
+    # The exact quote the fee/latency came from, and the ranking this plan won. A changed
+    # quote, or any change to the competing routes, invalidates the plan and its approval.
+    quote_id: EntityId
+    selected_rank: int = Field(ge=1)
+    route_set_fingerprint: Sha256Hex
     eligibility: EligibilitySnapshot
     supersedes_plan_id: EntityId | None = None
     selection_reasons: tuple[str, ...] = ()
@@ -157,6 +165,8 @@ class RecoveryPlan(DomainModel):
         selected = [e for e in self.evaluations if e.route_id == self.route_id]
         if len(selected) != 1 or not selected[0].passed:
             raise ValueError("selected route must appear exactly once as a passing evaluation")
+        if self.selected_rank != 1 or selected[0].rank != self.selected_rank:
+            raise ValueError("a plan must execute the rank-1 evaluation")
         return self
 
 
@@ -197,6 +207,9 @@ class ExecutionResult(DomainModel):
     finished_at: datetime | None = None
     # True when this call observed an existing execution instead of starting a new one.
     replayed: bool = False
+    # Canonical fingerprint of the provider request bound to `execution_key` (the physical
+    # attempt identity). Reusing the key for a different request must fail closed.
+    request_fingerprint: Sha256Hex | None = None
     detail: str | None = Field(default=None, max_length=280)
 
     @model_validator(mode="after")

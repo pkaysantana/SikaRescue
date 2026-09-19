@@ -24,7 +24,7 @@ ALL_TOOLS = (*INVESTIGATE, "inspect_recovery_plan", "get_recovery_audit_summary"
 
 
 async def plan_and_approve(world: DemoWorld, approver: str = "ops.demo") -> RecoveryPlan:
-    plan = await world.service.create_recovery_plan(TRANSACTION_ID)
+    plan = await world.service.create_recovery_plan(world.transaction_id)
     await world.service.approve_recovery(plan.plan_id, plan_hash=plan.plan_hash, approver=approver)
     return plan
 

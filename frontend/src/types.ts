@@ -15,7 +15,8 @@ export type RecoveryState =
 export type NextAction = "analyse" | "approve" | "execute" | "done" | "manual_review";
 
 export interface TransactionSummary {
-  transaction_id: string;
+  scenario_id: string; // the synthetic template, e.g. SK-10421
+  payment_instance_id: string; // the authoritative id every key binds to
   send_amount: string;
   payout_amount: string;
   fx_rate: string;
@@ -33,12 +34,16 @@ export interface JourneyLeg {
   detail: string | null;
   destination: string;
   is_recovery: boolean;
-  funds_here: boolean;
+  funds_here: boolean; // the LAST CONFIRMED funds location
 }
 
 export interface Diagnosis {
   state: RecoveryState;
-  funds_location: string;
+  funds_location: string; // last location proven by the journal
+  funds_certainty: "PROVEN" | "UNCERTAIN";
+  funds_label: string; // "Funds are here" | "Last confirmed here"
+  available_for_automatic_action: boolean;
+  uncertainty_reason: string | null;
   funds_at_recipient: boolean;
   sender_debited: boolean;
   sender_debit_count: number;
@@ -169,6 +174,7 @@ export interface StateTransition {
 export interface DemoView {
   state: RecoveryState;
   next_action: NextAction;
+  notice: string | null;
   configured_compute_backend: string;
   agent_mode: string;
   transaction: TransactionSummary;
@@ -179,9 +185,10 @@ export interface DemoView {
   execution: ExecutionSummary | null;
   reconciliation: ReconciliationSummary | null;
   transitions: StateTransition[];
-  payout_calls: number;
+  payout_calls: number; // provider calls for this payment instance
   telemetry: { enabled: boolean; exporting: boolean; detail: string };
   resets: number;
+  retired_instance_ids: string[];
 }
 
 export type Action = "load" | "reset" | "analyse" | "approve" | "execute";

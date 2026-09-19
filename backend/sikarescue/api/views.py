@@ -15,11 +15,12 @@ from pydantic import BaseModel, ConfigDict
 
 from sikarescue import telemetry
 from sikarescue.agent.advisor import AdvisoryOutcome, Orchestrator
-from sikarescue.demo_data.sk10421 import TRANSACTION_ID, DemoWorld
+from sikarescue.demo_data.sk10421 import SCENARIO_ID, DemoWorld
 from sikarescue.models import (
     AuditEventType,
     Currency,
     ExecutionResult,
+    FundsCertainty,
     FundsLocation,
     Money,
     OperationType,
@@ -27,7 +28,9 @@ from sikarescue.models import (
     ReconciliationResult,
     RecoveryState,
     RouteEvaluation,
+    TransactionState,
 )
+from sikarescue.services.repository import TransactionAggregate
 
 
 class View(BaseModel):
@@ -68,7 +71,8 @@ def pct(p: float | None) -> str | None:
 
 
 class TransactionSummary(View):
-    transaction_id: str
+    scenario_id: str  # the synthetic template, e.g. SK-10421
+    payment_instance_id: str  # the authoritative id every key binds to, e.g. SK-10421-3fa9c2d1
     send_amount: str
     payout_amount: str
     fx_rate: str
@@ -86,12 +90,16 @@ class JourneyLeg(View):
     detail: str | None
     destination: str
     is_recovery: bool
-    funds_here: bool
+    funds_here: bool  # the LAST CONFIRMED funds location (see Diagnosis.funds_certainty)
 
 
 class Diagnosis(View):
     state: RecoveryState
-    funds_location: str
+    funds_location: str  # last location proven by the journal
+    funds_certainty: FundsCertainty
+    funds_label: str  # "Funds are here" (PROVEN) | "Last confirmed here" (UNCERTAIN)
+    available_for_automatic_action: bool
+    uncertainty_reason: str | None
     funds_at_recipient: bool
     sender_debited: bool
     sender_debit_count: int
@@ -241,6 +249,7 @@ class TelemetryInfo(View):
 class DemoView(View):
     state: RecoveryState
     next_action: NextAction
+    notice: str | None  # why the flow is where it is, when that is not obvious
     configured_compute_backend: str
     agent_mode: str
     transaction: TransactionSummary
@@ -251,17 +260,20 @@ class DemoView(View):
     execution: ExecutionSummary | None
     reconciliation: ReconciliationSummary | None
     transitions: list[StateTransition]
-    payout_calls: int
+    payout_calls: int  # provider calls for THIS payment instance
     telemetry: TelemetryInfo
     resets: int
+    retired_instance_ids: list[str]  # instances that reached the provider; never reused
 
 
 # ------------------------------------------------------------------ builders
 
 
-def _next_action(state: RecoveryState) -> NextAction:
+def _next_action(state: RecoveryState, plan_visible: bool) -> NextAction:
     if state in (RecoveryState.FAILED, RecoveryState.DIAGNOSING, RecoveryState.RECOVERY_FAILED):
         return "analyse"
+    if state in (RecoveryState.AWAITING_APPROVAL, RecoveryState.APPROVED) and not plan_visible:
+        return "analyse"  # e.g. a stale plan was replaced: the replacement must be reviewed
     if state is RecoveryState.AWAITING_APPROVAL:
         return "approve"
     if state in (RecoveryState.APPROVED, RecoveryState.RECOVERY_EXECUTING):
@@ -271,14 +283,52 @@ def _next_action(state: RecoveryState) -> NextAction:
     return "manual_review"
 
 
+def _notice(
+    aggregate: TransactionAggregate, state: TransactionState, plan_visible: bool
+) -> str | None:
+    current = aggregate.current_plan
+    awaiting = aggregate.state in (RecoveryState.AWAITING_APPROVAL, RecoveryState.APPROVED)
+    if awaiting and not plan_visible and current is not None:
+        stale = next(
+            (
+                e.summary
+                for e in reversed(aggregate.audit)
+                if e.event_type is AuditEventType.PLAN_MARKED_STALE
+                and e.data.get("plan_id") == current.supersedes_plan_id
+            ),
+            None,
+        )
+        return (
+            f"{stale or 'The previous plan is no longer current'}. A replacement plan "
+            f"({current.plan_id}) was prepared. Analyse it, then approve it: the earlier "
+            "approval does not carry over."
+        )
+    if aggregate.state is RecoveryState.RECOVERY_FAILED:
+        return (
+            "The recovery payout was definitively rejected before acceptance, so no value "
+            "moved. Analyse again to plan a different route; the failed rail is excluded."
+        )
+    if state.funds_certainty is FundsCertainty.UNCERTAIN:
+        reason = state.uncertainty_reason or "the funds position is uncertain"
+        return (
+            f"{_sentence(reason)}. Automatic action is disabled; an operator must confirm "
+            "the outcome with the provider. The payout is never retried automatically."
+        )
+    return None
+
+
+def _sentence(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
 def _rail_name(world: DemoWorld, rail_id: str) -> str:
     return world.registry.get(RailId(rail_id)).display_name.replace("->", "→")
 
 
 def _journey(world: DemoWorld) -> list[JourneyLeg]:
-    state = world.service.get_transaction_state(TRANSACTION_ID)
+    state = world.service.get_transaction_state(world.transaction_id)
     legs = list(state.legs)
-    # Funds sit at the destination of the last leg that moved value.
+    # The last CONFIRMED location: the destination of the last leg that provably moved value.
     moved = [i for i, leg in enumerate(legs) if leg.status.value == "SUCCESS"]
     funds_index = moved[-1] if moved else None
     return [
@@ -327,7 +377,7 @@ def _route(world: DemoWorld, e: RouteEvaluation, selected_route: str) -> RouteOp
 
 def _analysis(world: DemoWorld, advisory: AdvisoryOutcome, exporting: bool) -> Analysis:
     plan = advisory.plan
-    aggregate = world.repository.get(TRANSACTION_ID)
+    aggregate = world.repository.get(world.transaction_id)
     compute = plan.compute
     assert compute is not None
     advice = advisory.advice
@@ -425,10 +475,11 @@ def build_view(
     *,
     agent_mode: str,
     resets: int,
+    retired_instance_ids: list[str] | tuple[str, ...] = (),
 ) -> DemoView:
-    aggregate = world.repository.get(TRANSACTION_ID)
+    aggregate = world.repository.get(world.transaction_id)
     instruction = aggregate.instruction
-    state = world.service.get_transaction_state(TRANSACTION_ID)
+    state = world.service.get_transaction_state(world.transaction_id)
     obligation = state.outstanding_obligation
     status = telemetry.status()
     plan = advisory.plan if advisory else None
@@ -439,13 +490,16 @@ def build_view(
     execution = next(
         (e for e in aggregate.executions.values() if plan and e.plan_id == plan.plan_id), None
     )
+    proven = state.funds_certainty is FundsCertainty.PROVEN
     return DemoView(
         state=aggregate.state,
-        next_action=_next_action(aggregate.state),
+        next_action=_next_action(aggregate.state, plan is not None),
+        notice=_notice(aggregate, state, plan is not None),
         configured_compute_backend=world.service.compute_backend,
         agent_mode=agent_mode,
         transaction=TransactionSummary(
-            transaction_id=instruction.transaction_id,
+            scenario_id=SCENARIO_ID,
+            payment_instance_id=instruction.transaction_id,
             send_amount=money(instruction.send_amount),
             payout_amount=money(instruction.payout_amount),
             fx_rate=f"{instruction.fx_rate:.2f}",
@@ -458,6 +512,10 @@ def build_view(
         diagnosis=Diagnosis(
             state=aggregate.state,
             funds_location=state.funds_location.value,
+            funds_certainty=state.funds_certainty,
+            funds_label="Funds are here" if proven else "Last confirmed here",
+            available_for_automatic_action=state.available_for_automatic_action,
+            uncertainty_reason=state.uncertainty_reason,
             funds_at_recipient=state.funds_location is FundsLocation.RECIPIENT_ENDPOINT,
             sender_debited=state.sender_debited,
             sender_debit_count=state.sender_debit_count,
@@ -493,9 +551,12 @@ def build_view(
             for e in aggregate.audit
             if e.event_type is AuditEventType.STATE_TRANSITION
         ],
-        payout_calls=len(world.gateway.requests),
+        payout_calls=sum(
+            1 for r in world.gateway.requests if r.transaction_id == world.transaction_id
+        ),
         telemetry=TelemetryInfo(
             enabled=status.enabled, exporting=status.exporting, detail=status.detail
         ),
         resets=resets,
+        retired_instance_ids=list(retired_instance_ids),
     )

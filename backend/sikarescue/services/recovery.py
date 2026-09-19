@@ -17,6 +17,7 @@ from sikarescue.errors import (
     ApprovalRequiredError,
     ComputeIntegrityError,
     ExecutionConflictError,
+    IdempotencyConflictError,
     IllegalTransitionError,
     ManualReviewRequiredError,
     NoEligibleRouteError,
@@ -77,6 +78,7 @@ from sikarescue.services.diagnosis import (
 )
 from sikarescue.services.liquidity import LiquidityBook
 from sikarescue.services.payout_gateway import (
+    IdempotencyKeyReuseError,
     PayoutRequest,
     PayoutResponse,
     SimulatedPayoutGateway,
@@ -88,6 +90,7 @@ from sikarescue.services.routes import (
     build_candidate,
     discover_candidates,
     eligibility_of,
+    route_set_fingerprint,
     verify_evaluations,
 )
 from sikarescue.services.state_machine import PLANNABLE_STATES, assert_transition
@@ -400,7 +403,10 @@ class RecoveryService:
         if problems:
             self._discard_planning_result(aggregate, problems, ComputeIntegrityError(problems))
 
-        evaluations = batch.evaluations
+        # Canonical order (rank 1 first, then rejected routes), independent of backend order.
+        evaluations = tuple(
+            sorted(batch.evaluations, key=lambda e: (e.rank is None, e.rank or 0, e.route_id))
+        )
         summary = batch.summary
         if summary.fallback_from:
             aggregate.record_audit(
@@ -434,7 +440,12 @@ class RecoveryService:
             self._escalate(aggregate, "no recovery route satisfies every hard constraint")
             raise NoEligibleRouteError("no eligible recovery route")
 
-        best = passing[0]
+        # Select by rank, never by position: a backend may return verified results in any order.
+        top = [e for e in passing if e.rank == 1]
+        if len(top) != 1:
+            problems = [f"expected exactly one rank-1 evaluation, found {len(top)}"]
+            self._discard_planning_result(aggregate, problems, ComputeIntegrityError(problems))
+        best = top[0]
         candidate = next(c for c in snapshot.candidates if c.route_id == best.route_id)
         # The world outside the journal (rail status, policy, liquidity, quotes) may also
         # have moved while we computed: the selected route must still look exactly the same.
@@ -450,6 +461,11 @@ class RecoveryService:
             self._discard_planning_result(
                 aggregate, [f"{candidate.rail.rail_id} eligibility or quote changed"]
             )
+        fingerprint = route_set_fingerprint(snapshot.candidates, self.simulation_config)
+        if self._live_route_set_fingerprint(aggregate, snapshot.obligation) != fingerprint:
+            self._discard_planning_result(
+                aggregate, ["competing routes changed while evaluating; ranking may differ"]
+            )
 
         obligation = snapshot.obligation
         plan = RecoveryPlan.build(
@@ -463,6 +479,9 @@ class RecoveryService:
             amount=obligation.amount,
             incremental_fee=candidate.quote.incremental_fee,
             expected_latency_seconds=candidate.quote.expected_latency_seconds,
+            quote_id=candidate.quote.quote_id,
+            selected_rank=best.rank,
+            route_set_fingerprint=fingerprint,
             eligibility=eligibility_of(candidate),
             supersedes_plan_id=snapshot.superseded_plan_id,
             selection_reasons=self._selection_reasons(
@@ -574,6 +593,14 @@ class RecoveryService:
 
     # ===================================================================== freshness
 
+    def _live_route_set_fingerprint(
+        self, aggregate: TransactionAggregate, obligation: OutstandingObligation
+    ) -> str:
+        candidates = discover_candidates(
+            aggregate, obligation, self.registry, self.policy, self.liquidity
+        )
+        return route_set_fingerprint(candidates, self.simulation_config)
+
     def _staleness(self, aggregate: TransactionAggregate, plan: RecoveryPlan) -> list[str]:
         """Why this plan no longer matches reality (empty list = still current)."""
         reasons: list[str] = []
@@ -597,6 +624,18 @@ class RecoveryService:
                     f"{plan.rail_id} fee changed "
                     f"({plan.incremental_fee} -> {candidate.quote.incremental_fee})"
                 )
+            if candidate.quote.quote_id != plan.quote_id:
+                reasons.append(
+                    f"{plan.rail_id} quote changed ({plan.quote_id} -> {candidate.quote.quote_id})"
+                )
+            if candidate.quote.expected_latency_seconds != plan.expected_latency_seconds:
+                reasons.append(f"{plan.rail_id} quoted arrival changed")
+            # Source, destination, amount, currency and recipient are covered by comparing the
+            # plan's obligation with the live one (check_recovery_preconditions above).
+            if self._live_route_set_fingerprint(aggregate, obligation) != (
+                plan.route_set_fingerprint
+            ):
+                reasons.append("competing routes changed since planning; rank 1 may differ")
         return reasons
 
     def _mark_stale(
@@ -740,7 +779,10 @@ class RecoveryService:
     # ===================================================================== execution
 
     async def execute_recovery(self, plan_id: str) -> ExecutionResult:
-        """Pay the outstanding obligation via the approved plan's rail, exactly once.
+        """Pay the outstanding obligation via the approved plan's rail: at most once per plan.
+
+        Idempotency records live in this process's memory (single worker). They are explicit
+        and fail closed, but they are not durable: this is not a durable exactly-once system.
 
         1. Admission (under the transaction lock): verify approval, freshness and every
            precondition, then atomically record the execution and enter RECOVERY_EXECUTING.
@@ -767,6 +809,10 @@ class RecoveryService:
         async with aggregate.lock:
             existing = aggregate.executions.get(key)
             if existing is not None:
+                if existing.request_fingerprint != self._payout_request(plan, key).fingerprint:
+                    raise IdempotencyConflictError(
+                        f"idempotency key {key} is bound to a different payout request"
+                    )
                 aggregate.record_audit(
                     AuditEventType.EXECUTION_REPLAYED,
                     ENGINE,
@@ -814,10 +860,25 @@ class RecoveryService:
         return reasons
 
     @staticmethod
+    def _payout_request(plan: RecoveryPlan, key: str) -> PayoutRequest:
+        """The one provider request this plan may ever send under its attempt key."""
+        return PayoutRequest(
+            idempotency_key=key,  # physical attempt identity (per plan)
+            effect_key=plan.obligation.effect_key,  # logical effect identity (per transaction)
+            transaction_id=plan.transaction_id,
+            rail_id=plan.rail_id,
+            source=plan.source,
+            amount=plan.amount,
+            recipient_token=plan.obligation.recipient_token,
+            endpoint_type=plan.obligation.endpoint_type,
+        )
+
+    @classmethod
     def _start_execution(
-        aggregate: TransactionAggregate, plan: RecoveryPlan, key: str
+        cls, aggregate: TransactionAggregate, plan: RecoveryPlan, key: str
     ) -> tuple[ExecutionResult, PayoutRequest]:
         """Caller holds the lock and has admitted the plan."""
+        request = cls._payout_request(plan, key)
         execution = ExecutionResult(
             execution_id=new_id("exe"),
             execution_key=key,
@@ -826,6 +887,7 @@ class RecoveryService:
             rail_id=plan.rail_id,
             status=ExecutionStatus.IN_PROGRESS,
             started_at=utcnow(),
+            request_fingerprint=request.fingerprint,
         )
         aggregate.executions[key] = execution
         aggregate.journal.record(
@@ -848,14 +910,6 @@ class RecoveryService:
             RecoveryState.RECOVERY_EXECUTING,
             actor=ENGINE,
             reason=f"admitted execution {execution.execution_id}",
-        )
-        request = PayoutRequest(
-            idempotency_key=key,
-            transaction_id=plan.transaction_id,
-            rail_id=plan.rail_id,
-            source=plan.source,
-            amount=plan.amount,
-            recipient_token=plan.obligation.recipient_token,
         )
         return execution, request
 
@@ -907,6 +961,11 @@ class RecoveryService:
         except TimeoutError:
             return _ambiguous_response(
                 "GATEWAY_TIMEOUT", f"No provider response within {self.payout_timeout_seconds}s."
+            )
+        except IdempotencyKeyReuseError:
+            # Fail closed: an earlier request under this key may already have moved value.
+            return _ambiguous_response(
+                "IDEMPOTENCY_KEY_REUSED", "Provider refused a reused key for a different request."
             )
         except Exception as exc:
             return _ambiguous_response("TRANSPORT_ERROR", f"{type(exc).__name__} after dispatch.")
@@ -1065,7 +1124,7 @@ class RecoveryService:
                     name="single_fx_and_settlement",
                     passed=journal.count_effects(OperationType.FX_CONVERSION) == 1
                     and journal.count_effects(OperationType.GH_SETTLEMENT) == 1,
-                    detail="FX and GH settlement each posted exactly once",
+                    detail="FX and GH settlement each posted once in the journal",
                 ),
                 ReconciliationCheck(
                     name="single_recipient_credit",
@@ -1122,11 +1181,15 @@ class RecoveryService:
             aggregate.record_audit(
                 AuditEventType.RECONCILED,
                 ENGINE,
-                "Ledger reconciled: 1 sender debit, 1 recipient credit, 0 duplicates",
+                f"Internal reconciliation checks passed: {result.sender_debit_count} sender "
+                f"debit, {result.recipient_credit_count} recipient credit, "
+                f"{result.duplicate_sender_debits} duplicates",
                 duplicate_sender_debits=result.duplicate_sender_debits,
             )
             aggregate.transition(
-                RecoveryState.RECONCILED, actor=ENGINE, reason="all reconciliation checks passed"
+                RecoveryState.RECONCILED,
+                actor=ENGINE,
+                reason="all internal reconciliation checks passed",
             )
             return result
 

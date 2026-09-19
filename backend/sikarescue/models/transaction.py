@@ -20,6 +20,7 @@ from sikarescue.models.enums import (
     AttemptOutcome,
     CountryCode,
     EndpointType,
+    FundsCertainty,
     FundsLocation,
     OperationType,
     RailId,
@@ -111,7 +112,12 @@ class TransactionState(DomainModel):
     recipient_credited: bool
     sender_debit_count: int = Field(ge=0)
     recipient_credit_count: int = Field(ge=0)
+    # The last location PROVEN by journal effects. Only while `funds_certainty` is PROVEN may
+    # it be presented as where the funds are now.
     funds_location: FundsLocation
+    funds_certainty: FundsCertainty
+    available_for_automatic_action: bool
+    uncertainty_reason: str | None = Field(default=None, max_length=200)
     failed_leg: RailId | None
     last_payout_outcome: AttemptOutcome | None
     safe_to_restart_from_origin: bool

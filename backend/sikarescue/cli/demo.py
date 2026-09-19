@@ -31,6 +31,7 @@ from sikarescue.models import (
     Currency,
     ExecutionResult,
     ExecutionStatus,
+    FundsCertainty,
     Money,
     OperationType,
     ReconciliationResult,
@@ -172,12 +173,15 @@ async def _run_demo(
     p(f"  stage   : {failure.stage} (provider rejected before accepting the request)")
     p(f"  outcome : {failed_attempt.outcome} → no value moved")
     p()
-    p(f"Funds currently located: {state.funds_location}")
+    if state.funds_certainty is FundsCertainty.PROVEN:
+        p(f"Funds currently located: {state.funds_location}")
+    else:
+        p(f"Last confirmed funds location: {state.funds_location} ({state.uncertainty_reason})")
     p(f"{WARN} Important: sender already debited → do NOT restart from origin")
     p(f"  safe_to_restart_from_origin = {state.safe_to_restart_from_origin}")
     obligation = state.outstanding_obligation
     assert obligation is not None
-    p(f"Outstanding obligation: credit the recipient {_money(obligation.amount)} exactly once")
+    p(f"Outstanding obligation: credit the recipient {_money(obligation.amount)} (at most once)")
     p(f"  ({obligation.effect_key})")
 
     # 2. Model boundary -------------------------------------------------------------
@@ -283,7 +287,7 @@ async def _run_demo(
     p(request.summary)
     if auto_approve:
         approved = True
-        p(f"Approved via --approve (approver: {APPROVER}).")
+        p(f"Approved via --approve (approver: {APPROVER}, an unauthenticated CLI operator).")
     else:
         try:
             answer = input_fn(f"Approve plan {plan.plan_id} ({plan.rail_id})? [y/N] ")
@@ -323,7 +327,7 @@ async def _run_demo(
             trace_id=trace_id,
         )
     p(f"{OK} Recipient credited {_money(plan.amount)} via {plan.rail_id}")
-    p(f"{OK} Sender NOT debited again (sender debit effect replay is structurally impossible)")
+    p(f"{OK} Sender NOT debited again (the journal admits one sender-debit effect only)")
 
     # 8. Reconcile ------------------------------------------------------------------
     p.section("8. Reconciliation")
@@ -446,7 +450,7 @@ def _responsibilities(p: _Printer, advisory: AdvisoryOutcome, *, reconciled: boo
     p("Deterministic core : created the immutable plan · required human approval")
     p(
         "                     executed only the outstanding payout"
-        + (" · reconciled" if reconciled else "")
+        + (" · internal reconciliation checks passed" if reconciled else "")
     )
 
 
@@ -471,7 +475,11 @@ def _proof(
     p(f"sender debit count       : {state.sender_debit_count}")
     p(f"recipient credit count   : {state.recipient_credit_count}")
     p(f"duplicate sender debits  : {max(0, state.sender_debit_count - 1)}")
-    p(f"funds located            : {state.funds_location}")
+    if state.funds_certainty is FundsCertainty.PROVEN:
+        p(f"funds located            : {state.funds_location}")
+    else:
+        p(f"funds last confirmed at  : {state.funds_location} (position UNCERTAIN)")
+        p("automatic action         : disabled (recipient may already have been credited)")
     p(f"state                    : {state.recovery_state}")
     summary = plan.compute if plan is not None else None
     if summary is None:

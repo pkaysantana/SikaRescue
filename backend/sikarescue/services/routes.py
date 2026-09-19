@@ -7,6 +7,9 @@ repository; `verify_evaluations` is re-exported for the recovery service.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from sikarescue.compute.constraints import hard_constraint_violations
 from sikarescue.compute.verification import verify_evaluations
 from sikarescue.models import (
@@ -16,6 +19,7 @@ from sikarescue.models import (
     OperationType,
     OutstandingObligation,
     RailId,
+    SimulationConfig,
     route_id_for,
 )
 from sikarescue.services.liquidity import LiquidityBook
@@ -29,6 +33,7 @@ __all__ = [
     "eligibility_of",
     "failed_payout_rails",
     "hard_constraint_violations",
+    "route_set_fingerprint",
     "verify_evaluations",
 ]
 
@@ -80,6 +85,37 @@ def discover_candidates(
         build_candidate(aggregate, obligation, rail.rail_id, registry, policy, liquidity)
         for rail in registry.payout_rails_from(obligation.source)
     )
+
+
+def route_set_fingerprint(
+    candidates: tuple[CandidateRecoveryRoute, ...], config: SimulationConfig
+) -> str:
+    """Hash of everything that decides WHICH route ranks first.
+
+    Covers every candidate's hard-constraint result, quote (id, fee, latency, reliability),
+    dependency count and simulation profile, plus the simulation config. Simulation is seeded
+    and counter-based, so while this is unchanged the ranking is unchanged too. A plan whose
+    fingerprint no longer matches may no longer be the rank-1 route and must be re-planned.
+    """
+    routes = sorted(
+        (
+            {
+                "rail": c.rail.rail_id.value,
+                "violations": [reason.value for reason, _ in hard_constraint_violations(c)],
+                "quote_id": c.quote.quote_id,
+                "fee": str(c.quote.incremental_fee),
+                "latency": c.quote.expected_latency_seconds,
+                "quoted_reliability": c.quote.quoted_reliability,
+                "dependencies": c.rail.dependency_count,
+                "profile": c.simulation_profile.model_dump(mode="json"),
+            }
+            for c in candidates
+        ),
+        key=lambda r: r["rail"],
+    )
+    payload = {"routes": routes, "simulation": config.model_dump(mode="json")}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def eligibility_of(candidate: CandidateRecoveryRoute) -> EligibilitySnapshot:

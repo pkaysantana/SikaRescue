@@ -14,7 +14,7 @@ flowchart LR
     V --> P[Immutable, hash-sealed RecoveryPlan]
     P --> A[Human approval of exactly that plan]
     A --> X[Atomic, idempotent execution of the remaining leg]
-    X --> R[Reconciliation]
+    X --> R[Internal reconciliation checks]
   end
   F -- "surviving routes only:<br/>synthetic profile + scenario + seed + trial range" --> C
   subgraph C["Compute backend (statistics only)"]
@@ -27,6 +27,57 @@ flowchart LR
 The Pydantic AI agent (Phase 5, below) sits outside this diagram. It can call four scoped
 tools and explain the results, but it never owns state, performs financial arithmetic or
 chooses routes.
+
+## What is guaranteed, and what is not
+
+SikaRescue is a single-process demo. Its claims are deliberately narrow.
+
+**Guaranteed** (enforced in code, covered by tests):
+
+- **Deterministic single-process invariants.** The append-only journal refuses a second
+  effect for the same logical key, a location discontinuity, and any amount or currency
+  discontinuity between consecutive effects (the first must consume the payment principal;
+  FX is checked against its own explicit source and destination amounts).
+- **Explicit idempotency controls.** The logical financial-effect key
+  (`{instance}:recipient_credit`, at most one per payment instance) is separate from the
+  physical provider-attempt key (`{instance}:plan:{plan}:payout`). Every attempt key is bound
+  to a canonical request fingerprint (instance, effect, rail, source, recipient token,
+  endpoint, currency, amount); reusing a key for a different request fails closed and never
+  moves value.
+- **Plan-, hash- and revision-bound approval.** A plan executes only the rank-1 evaluation. Its
+  hash covers the rail, source, destination, amount, currency, incremental fee, quote id,
+  policy result and version, recipient compatibility, route status, selected rank, and a
+  fingerprint of every competing route's ranking inputs. If any of these changes after
+  approval, the plan is marked stale; a new plan and a new approval are required.
+- **Conservative UNKNOWN semantics.** A payout whose outcome cannot be proven is UNKNOWN:
+  the transaction goes to MANUAL_REVIEW, funds certainty is UNCERTAIN, automatic action is
+  disabled, and the payout is never retried. The UI shows only the *last confirmed* location
+  and says the recipient may already have been credited.
+- **Locally verified Modal results.** Rejected routes are never simulated, and every returned
+  shard is re-verified before use.
+- **The model cannot execute financial effects.** It has four read-only tools; its structured
+  advice is checked against the deterministic plan and screened for personal data.
+- **Internal reconciliation checks** over this process's own journal (one sender debit, one
+  recipient credit, no duplicates, funds at the recipient endpoint).
+
+**Not claimed:**
+
+- durable exactly-once execution (idempotency records live in memory and are lost on restart);
+- multi-worker or multi-process safety (the demo server runs one worker);
+- external reconciliation against a provider statement or bank feed;
+- authenticated approval (the approver is an unauthenticated demo operator: no login or RBAC);
+- signed or cryptographic recovery certificates;
+- real providers, callbacks or a durable outbox.
+
+### Demo reset and payment identity
+
+`SK-10421` is the synthetic scenario template. The web demo runs each attempt as a unique
+payment instance (`SK-10421-<8 hex>`); every authoritative effect, idempotency and execution
+key binds to that instance id. The simulated payout provider outlives resets and remembers
+every key it has seen. A reset after any payout dispatch retires the instance and starts a new
+one; a retired id can never be seeded again. A reset before any dispatch rebuilds the same
+instance, because nothing external has seen it. The CLI and tests run the template as a
+single payment in a fresh process.
 
 ## Why Modal exists
 
@@ -43,7 +94,8 @@ Modal is **not** used to make financial-policy decisions. The deterministic appl
    rejects anything malformed;
 3. **creates the plan** (bound to the transaction revision and sealed by a content hash);
 4. **owns approval** (a human approves exactly one immutable plan);
-5. **executes the payment state machine** (only the outstanding leg, exactly once).
+5. **executes the payment state machine** (only the outstanding leg, at most once per
+   approved plan, within one process).
 
 Modal therefore contributes **only synthetic simulation statistics**. A malicious or broken
 result cannot make TOKEN_BRIDGE permissible, resurrect MOMO_A, change an amount or fee,

@@ -60,6 +60,13 @@ class FundsLocation(StrEnum):
     RECIPIENT_ENDPOINT = "RECIPIENT_ENDPOINT"
 
 
+class FundsCertainty(StrEnum):
+    """How sure we are that the funds are still where the journal last proved them to be."""
+
+    PROVEN = "PROVEN"  # no payout in flight and no UNKNOWN outcome: the journal is the truth
+    UNCERTAIN = "UNCERTAIN"  # a payout is in flight or UNKNOWN: value may already have moved
+
+
 class OperationType(StrEnum):
     """Logical value-moving operations. Each succeeds at most once per transaction."""
 

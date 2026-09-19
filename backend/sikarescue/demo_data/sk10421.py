@@ -10,6 +10,7 @@ so it is DEFINITIVE_FAILED and no value moved: funds sit in GH_SETTLEMENT_ACCOUN
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -53,7 +54,12 @@ from sikarescue.services.rails import RailRegistry
 from sikarescue.services.recovery import RecoveryService
 from sikarescue.services.repository import InMemoryTransactionRepository, TransactionAggregate
 
-TRANSACTION_ID = "SK-10421"
+# SK-10421 is the synthetic SCENARIO TEMPLATE. The CLI and tests run it as a single payment
+# whose id is the template id. The resettable web demo runs each attempt as a fresh, unique
+# payment INSTANCE (`SK-10421-<8 hex>`): authoritative effect, idempotency and execution keys
+# all bind to the instance id, so an instance that reached a provider is never replayed.
+SCENARIO_ID = "SK-10421"
+TRANSACTION_ID = SCENARIO_ID
 FX_RATE = Decimal("15.250000")  # synthetic GBP->GHS rate
 SEND_AMOUNT = Money.of("120.00", Currency.GBP)
 PAYOUT_AMOUNT = Money.of("1830.00", Currency.GHS)
@@ -68,9 +74,14 @@ RECIPIENT_TOKEN = "rcp_8f3k2m9q"
 _SETTLEMENT = FundsLocation.GH_SETTLEMENT_ACCOUNT
 
 
-def build_instruction() -> PaymentTransaction:
+def new_instance_id() -> str:
+    """A fresh payment-instance id for the SK-10421 scenario, e.g. `SK-10421-3fa9c2d1`."""
+    return f"{SCENARIO_ID}-{uuid.uuid4().hex[:8]}"
+
+
+def build_instruction(transaction_id: str = TRANSACTION_ID) -> PaymentTransaction:
     return PaymentTransaction(
-        transaction_id=TRANSACTION_ID,
+        transaction_id=transaction_id,
         created_at=BASE_TIME,
         origin_country=CountryCode.GB,
         destination_country=CountryCode.GH,
@@ -222,12 +233,14 @@ _MOMO_A_FAILURES = {
 
 def seed_transaction(
     momo_a_outcome: AttemptOutcome = AttemptOutcome.DEFINITIVE_FAILED,
+    *,
+    transaction_id: str = TRANSACTION_ID,
 ) -> TransactionAggregate:
     """Build the aggregate with journal evidence for the three successful legs + MOMO_A."""
     if momo_a_outcome is AttemptOutcome.SUCCEEDED:
         raise ValueError("the demo scenario requires a failed MOMO_A payout")
-    instruction = build_instruction()
-    journal = FinancialJournal(TRANSACTION_ID)
+    instruction = build_instruction(transaction_id)
+    journal = FinancialJournal(transaction_id, principal=SEND_AMOUNT)
     aggregate = TransactionAggregate(instruction=instruction, journal=journal)
 
     upstream = [
@@ -240,14 +253,14 @@ def seed_transaction(
         source, destination = OPERATION_FLOW[op]
         attempt = OperationAttempt(
             attempt_id=f"att_{n:012x}",
-            transaction_id=TRANSACTION_ID,
+            transaction_id=transaction_id,
             operation=op,
             rail_id=rail,
             source=source,
             destination=destination,
             amount=source_amount,
             outcome=AttemptOutcome.SUCCEEDED,
-            idempotency_key=effect_key(TRANSACTION_ID, op),
+            idempotency_key=effect_key(transaction_id, op),
             provider_reference=f"prv_seed{n:08d}",
             started_at=at,
             completed_at=at + timedelta(seconds=5),
@@ -255,8 +268,8 @@ def seed_transaction(
         journal.record_attempt(attempt)
         journal.post_effect(
             FinancialEffect(
-                effect_key=effect_key(TRANSACTION_ID, op),
-                transaction_id=TRANSACTION_ID,
+                effect_key=effect_key(transaction_id, op),
+                transaction_id=transaction_id,
                 operation=op,
                 rail_id=rail,
                 attempt_id=attempt.attempt_id,
@@ -281,14 +294,14 @@ def seed_transaction(
     journal.record_attempt(
         OperationAttempt(
             attempt_id=f"att_{4:012x}",
-            transaction_id=TRANSACTION_ID,
+            transaction_id=transaction_id,
             operation=OperationType.RECIPIENT_CREDIT,
             rail_id=RailId.MOMO_A,
             source=source,
             destination=destination,
             amount=PAYOUT_AMOUNT,
             outcome=momo_a_outcome,
-            idempotency_key=f"{TRANSACTION_ID}:original:MOMO_A:payout",
+            idempotency_key=f"{transaction_id}:original:MOMO_A:payout",
             failure=failure,
             started_at=at,
             completed_at=at + timedelta(seconds=2),
@@ -308,6 +321,7 @@ def seed_transaction(
 
 @dataclass
 class DemoWorld:
+    transaction_id: str  # the authoritative payment instance id
     repository: InMemoryTransactionRepository
     registry: RailRegistry
     policy: PolicyEngine
@@ -323,13 +337,21 @@ def build_demo_world(
     compute: RouteComputeBackend | None = None,
     simulation: SimulationConfig | None = None,
     payout_timeout_seconds: float = 30.0,
+    transaction_id: str = TRANSACTION_ID,
+    gateway: SimulatedPayoutGateway | None = None,
 ) -> DemoWorld:
+    """A seeded world for ONE payment instance.
+
+    Pass a shared `gateway` to model a provider that outlives the world: it remembers every
+    idempotency key it has seen, exactly as an external payout provider would.
+    """
     repository = InMemoryTransactionRepository()
-    repository.add(seed_transaction(momo_a_outcome))
+    repository.add(seed_transaction(momo_a_outcome, transaction_id=transaction_id))
     registry = RailRegistry(build_rails(), build_quotes(), build_simulation_profiles())
     policy = build_policy()
     liquidity = build_liquidity()
-    gateway = SimulatedPayoutGateway(latency_seconds=payout_latency_seconds)
+    if gateway is None:
+        gateway = SimulatedPayoutGateway(latency_seconds=payout_latency_seconds)
     service = RecoveryService(
         repository,
         registry,
@@ -340,4 +362,4 @@ def build_demo_world(
         simulation_config=simulation or simulation_config(),
         payout_timeout_seconds=payout_timeout_seconds,
     )
-    return DemoWorld(repository, registry, policy, liquidity, gateway, service)
+    return DemoWorld(transaction_id, repository, registry, policy, liquidity, gateway, service)

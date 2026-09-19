@@ -27,6 +27,7 @@ from sikarescue.models.enums import (
     Currency,
     EndpointType,
     FeeBearer,
+    FundsCertainty,
     FundsLocation,
     HardConstraintStatus,
     OperationType,
@@ -62,7 +63,8 @@ class ModelTransactionView(DomainModel):
     revision: int
     sender_debited: bool
     recipient_credited: bool
-    funds_location: FundsLocation
+    funds_location: FundsLocation  # last location proven by the journal
+    funds_certainty: FundsCertainty
     failed_leg: RailId | None
     last_payout_outcome: AttemptOutcome | None
     failure_summary: str | None = Field(default=None, max_length=120)

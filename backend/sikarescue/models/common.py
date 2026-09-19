@@ -18,7 +18,8 @@ class DomainModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-TransactionId = Annotated[str, StringConstraints(pattern=r"^SK-\d{5}$")]
+# `SK-10421` (a scenario run as one payment) or `SK-10421-3fa9c2d1` (a unique demo instance).
+TransactionId = Annotated[str, StringConstraints(pattern=r"^SK-\d{5}(-[0-9a-f]{8})?$")]
 # Generated identifiers: `<prefix>_<12 hex>`, e.g. `plan_1a2b3c4d5e6f`.
 EntityId = Annotated[str, StringConstraints(pattern=r"^[a-z]{2,5}_[0-9a-f]{12}$")]
 RouteId = Annotated[str, StringConstraints(pattern=r"^rt_[A-Z0-9_]+$")]
