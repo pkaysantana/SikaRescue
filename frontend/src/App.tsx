@@ -136,7 +136,7 @@ export default function App() {
   const plan = view?.analysis?.plan;
   const reset = () => run("reset", () => api.reset(), "top");
   const switchScenario = (scenario: string) => run("reset", () => api.reset(scenario), "top");
-  const classify = () => run("classify", api.classify, "frontier");
+  const classify = () => run("classify", api.classify); // stay on the verdict
   const analyse = () => run("analyse", api.analyse, "routes");
   const approve = () => plan && run("approve", () => api.approve(plan.plan_id, plan.plan_hash), "execute");
   const execute = () => plan && run("execute", () => api.execute(plan.plan_id), "proof");
