@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     payout_latency_seconds: float = Field(default=0.5, ge=0, le=30)
     # No provider answer within this window after dispatch => outcome UNKNOWN (manual review).
     payout_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    # Synthetic reliability simulation (seeded => reproducible).
+    simulation_seed: int = Field(default=10421, ge=0)
+    simulation_trials_per_scenario: int = Field(default=2000, ge=100, le=1_000_000)
 
 
 @lru_cache

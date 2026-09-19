@@ -2,6 +2,7 @@
 
 from sikarescue.models.audit import AuditEvent
 from sikarescue.models.common import DomainModel, Money, new_id, utcnow
+from sikarescue.models.compute import RouteEvaluationBatch, RouteEvaluationRequest
 from sikarescue.models.enums import (
     Actor,
     AttemptOutcome,
@@ -21,6 +22,7 @@ from sikarescue.models.enums import (
     RailType,
     RecoveryState,
     RejectionReason,
+    ScenarioId,
     SettlementLegStatus,
 )
 from sikarescue.models.ledger import (
@@ -61,6 +63,14 @@ from sikarescue.models.routes import (
     ScoreBreakdown,
     route_id_for,
 )
+from sikarescue.models.simulation import (
+    ComputeRunSummary,
+    HopProfile,
+    OperatingScenario,
+    RouteSimulationProfile,
+    RouteSimulationResult,
+    SimulationConfig,
+)
 from sikarescue.models.transaction import (
     OutstandingObligation,
     PaymentTransaction,
@@ -78,6 +88,7 @@ __all__ = [
     "AuditEvent",
     "AuditEventType",
     "CandidateRecoveryRoute",
+    "ComputeRunSummary",
     "CountryCode",
     "Currency",
     "DomainModel",
@@ -94,12 +105,14 @@ __all__ = [
     "FinancialEffect",
     "FundsLocation",
     "HardConstraintStatus",
+    "HopProfile",
     "JournalEntry",
     "LiquidityStatus",
     "ModelLegView",
     "ModelRouteView",
     "ModelTransactionView",
     "Money",
+    "OperatingScenario",
     "OperationAttempt",
     "OperationType",
     "OutstandingObligation",
@@ -122,9 +135,15 @@ __all__ = [
     "RecoveryState",
     "RejectionReason",
     "RouteEvaluation",
+    "RouteEvaluationBatch",
+    "RouteEvaluationRequest",
+    "RouteSimulationProfile",
+    "RouteSimulationResult",
+    "ScenarioId",
     "ScoreBreakdown",
     "SettlementLeg",
     "SettlementLegStatus",
+    "SimulationConfig",
     "TransactionState",
     "effect_key",
     "new_id",

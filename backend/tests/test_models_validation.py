@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+from sikarescue.compute.scenarios import SCENARIOS
 from sikarescue.demo_data.sk10421 import TRANSACTION_ID
 from sikarescue.models import (
     AttemptOutcome,
@@ -23,10 +24,28 @@ from sikarescue.models import (
     RecoveryPlan,
     RejectionReason,
     RouteEvaluation,
+    RouteSimulationResult,
+    ScenarioId,
 )
 
 NOW = datetime(2026, 9, 19, 10, 0, tzinfo=UTC)
 GBP = Currency.GBP
+
+
+def _sim_result(**overrides) -> RouteSimulationResult:
+    fields = {
+        "route_id": "rt_MOMO_B",
+        "scenario": SCENARIOS[ScenarioId.NORMAL],
+        "simulation_count": 2000,
+        "successful_runs": 1962,
+        "simulated_success_probability": 0.981,
+        "p50_latency_seconds": 70.0,
+        "p95_latency_seconds": 108.0,
+        "recovery_within_sla_probability": 0.96,
+        "sla_seconds": 120.0,
+        "seed": 10421,
+    }
+    return RouteSimulationResult(**(fields | overrides))
 
 
 def _evaluation(**overrides):
@@ -41,6 +60,11 @@ def _evaluation(**overrides):
                   "total": 0.8},
         "rank": 1,
         "compute_backend": "local",
+        "scenario_results": (_sim_result(),),
+        "simulated_success_probability": 0.981,
+        "p50_latency_seconds": 70.0,
+        "p95_latency_seconds": 108.0,
+        "simulated_within_sla_probability": 0.96,
     }  # fmt: skip
     return RouteEvaluation(**(fields | overrides))
 
@@ -62,6 +86,9 @@ def test_valid_evaluation_builds():
         {"score": None},  # passing route must be scored
         {"hard_constraint_status": HardConstraintStatus.REJECTED},  # rejected but scored/ranked
         {"p50_latency_seconds": 90.0, "p95_latency_seconds": 60.0},  # p95 < p50
+        {"scenario_results": ()},  # passing route must carry simulation results
+        {"simulated_success_probability": 0.999},  # must match the primary scenario result
+        {"scenario_results": (_sim_result(route_id="rt_TOKEN_BRIDGE"),)},  # another route's
     ],
 )
 def test_malformed_evaluation_rejected(overrides):
@@ -69,16 +96,47 @@ def test_malformed_evaluation_rejected(overrides):
         _evaluation(**overrides)
 
 
+REJECTED_UNSIMULATED = {
+    "hard_constraint_status": HardConstraintStatus.REJECTED,
+    "score": None,
+    "rank": None,
+    "scenario_results": (),
+    "simulated_success_probability": None,
+    "p50_latency_seconds": None,
+    "p95_latency_seconds": None,
+    "simulated_within_sla_probability": None,
+}
+
+
 def test_rejected_evaluation_requires_reason():
     with pytest.raises(ValidationError):
-        _evaluation(hard_constraint_status=HardConstraintStatus.REJECTED, score=None, rank=None)
-    ok = _evaluation(
-        hard_constraint_status=HardConstraintStatus.REJECTED,
-        score=None,
-        rank=None,
-        rejection_reasons=(RejectionReason.POLICY_DENIED,),
-    )
+        _evaluation(**REJECTED_UNSIMULATED)
+    ok = _evaluation(**REJECTED_UNSIMULATED, rejection_reasons=(RejectionReason.POLICY_DENIED,))
     assert not ok.passed
+
+
+def test_rejected_route_can_never_carry_simulation_results():
+    with pytest.raises(ValidationError, match="never simulated"):
+        _evaluation(
+            **(REJECTED_UNSIMULATED | {"scenario_results": (_sim_result(),)}),
+            rejection_reasons=(RejectionReason.POLICY_DENIED,),
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"successful_runs": 2001},  # more successes than runs
+        {"simulated_success_probability": 0.5},  # inconsistent with the counts
+        {"recovery_within_sla_probability": 0.99},  # within-SLA must be a subset of successes
+        {"p50_latency_seconds": None},  # successes imply latency percentiles
+        {"p50_latency_seconds": 120.0},  # p95 below p50
+        {"synthetic": False},  # simulated data must be labelled synthetic
+    ],
+)
+def test_malformed_simulation_result_rejected(overrides):
+    with pytest.raises(ValidationError):
+        _sim_result(**overrides)
 
 
 @pytest.mark.parametrize("amount", [0.18, "-1.00", "1.001", "abc"])

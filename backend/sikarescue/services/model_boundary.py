@@ -71,6 +71,8 @@ def build_model_route_views(evaluations: Iterable[RouteEvaluation]) -> tuple[Mod
             expected_latency_seconds=e.expected_latency_seconds,
             quoted_reliability=e.quoted_reliability,
             simulated_success_probability=e.simulated_success_probability,
+            simulated_within_sla_probability=e.simulated_within_sla_probability,
+            p95_latency_seconds=e.p95_latency_seconds,
             score=e.score.total if e.score else None,
             rank=e.rank,
         )

@@ -4,6 +4,12 @@ SYNTHETIC HACKATHON SCORING MODEL: weights and reference bounds are illustrative
 real production routing or treasury policy. Only routes that already passed every hard
 constraint are ever scored.
 
+Inputs (see `compute.evaluation.scoring_input`):
+  reliability   <- SIMULATED success probability (primary scenario)
+  latency       <- SIMULATED p95 latency to recipient credit (tail-aware)
+  cost          <- quoted incremental fee (deterministic money, never simulated)
+  route quality <- number of external dependencies on the payout path
+
 Each component is normalised to [0, 1] against FIXED reference bounds (not min-max over
 the candidate set), so adding or removing a route never changes another route's score.
 """

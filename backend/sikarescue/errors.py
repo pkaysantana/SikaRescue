@@ -71,5 +71,17 @@ class StalePlanningResultError(SikaRescueError):
         super().__init__(f"planning result discarded as stale: {'; '.join(reasons)}")
 
 
+class ConfigurationError(SikaRescueError):
+    """Invalid or unavailable runtime configuration (e.g. an unknown compute backend)."""
+
+
+class ComputeIntegrityError(SikaRescueError):
+    """A compute backend's result failed independent local verification; nothing persisted."""
+
+    def __init__(self, problems: list[str]):
+        self.problems = problems
+        super().__init__(f"compute result rejected: {'; '.join(problems)}")
+
+
 class PIILeakError(SikaRescueError):
     """Recipient PII was about to cross the model boundary."""

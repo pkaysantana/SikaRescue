@@ -1,22 +1,22 @@
-"""Route discovery, hard-constraint filtering and deterministic evaluation.
+"""Route discovery (from live state) and independent verification of compute results.
 
-Order is fixed: build candidates -> apply hard constraints -> score survivors -> rank.
-A rejected route is never scored, so optimisation can never trade away a constraint.
+Evaluation itself (hard filters -> simulation -> scoring) lives in `sikarescue.compute` so
+any compute backend can run it. This module only builds candidates from the repository and
+re-verifies whatever a backend returns before it may influence a plan.
 """
 
 from __future__ import annotations
 
-from sikarescue.compute.scoring import ScoringInput, score_route
+from sikarescue.compute.constraints import hard_constraint_violations
+from sikarescue.compute.evaluation import ranking_key, scoring_input
+from sikarescue.compute.scoring import score_route
 from sikarescue.models import (
     AttemptOutcome,
     CandidateRecoveryRoute,
     EligibilitySnapshot,
-    HardConstraintStatus,
     OperationType,
     OutstandingObligation,
     RailId,
-    RailStatus,
-    RejectionReason,
     RouteEvaluation,
     route_id_for,
 )
@@ -24,6 +24,15 @@ from sikarescue.services.liquidity import LiquidityBook
 from sikarescue.services.policy import PolicyEngine
 from sikarescue.services.rails import RailRegistry
 from sikarescue.services.repository import TransactionAggregate
+
+__all__ = [
+    "build_candidate",
+    "discover_candidates",
+    "eligibility_of",
+    "failed_payout_rails",
+    "hard_constraint_violations",
+    "verify_evaluations",
+]
 
 
 def failed_payout_rails(aggregate: TransactionAggregate) -> frozenset[RailId]:
@@ -57,6 +66,7 @@ def build_candidate(
         recipient_compatible=obligation.endpoint_type in rail.supported_endpoints,
         is_original_rail=rail_id in instruction.original_route,
         failed_earlier_for_transaction=rail_id in failed_payout_rails(aggregate),
+        simulation_profile=registry.simulation_profile(rail_id),
     )
 
 
@@ -74,38 +84,6 @@ def discover_candidates(
     )
 
 
-def hard_constraint_violations(
-    candidate: CandidateRecoveryRoute,
-) -> list[tuple[RejectionReason, str]]:
-    violations: list[tuple[RejectionReason, str]] = []
-    rail_id = candidate.rail.rail_id
-    if not candidate.policy.permitted:
-        detail = "; ".join(f"{d.rule_id}: {d.detail}" for d in candidate.policy.denials)
-        violations.append((RejectionReason.POLICY_DENIED, detail))
-    if candidate.rail.status is RailStatus.DOWN:
-        violations.append((RejectionReason.RAIL_UNAVAILABLE, f"{rail_id} is DOWN"))
-    if not candidate.recipient_compatible:
-        violations.append(
-            (RejectionReason.RECIPIENT_INCOMPATIBLE, f"{rail_id} cannot pay this endpoint type")
-        )
-    if not candidate.liquidity.sufficient:
-        liq = candidate.liquidity
-        violations.append(
-            (
-                RejectionReason.INSUFFICIENT_LIQUIDITY,
-                f"available {liq.available} < required {liq.required}",
-            )
-        )
-    if candidate.failed_earlier_for_transaction:
-        violations.append(
-            (
-                RejectionReason.FAILED_EARLIER_FOR_TRANSACTION,
-                f"{rail_id} already failed a payout attempt for this transaction",
-            )
-        )
-    return violations
-
-
 def eligibility_of(candidate: CandidateRecoveryRoute) -> EligibilitySnapshot:
     return EligibilitySnapshot(
         rail_status=candidate.rail.status,
@@ -116,59 +94,37 @@ def eligibility_of(candidate: CandidateRecoveryRoute) -> EligibilitySnapshot:
     )
 
 
-def evaluate_routes(
-    candidates: tuple[CandidateRecoveryRoute, ...], compute_backend: str = "local"
-) -> tuple[RouteEvaluation, ...]:
-    """Hard-filter, then score and rank survivors. Passing routes first (rank 1 = best)."""
-    scored = []
-    rejected = []
-    for c in candidates:
-        common = {
-            "route_id": c.route_id,
-            "rail_id": c.rail.rail_id,
-            "estimated_incremental_cost": c.quote.incremental_fee,
-            "expected_latency_seconds": c.quote.expected_latency_seconds,
-            "quoted_reliability": c.quote.quoted_reliability,
-            "compute_backend": compute_backend,
-        }
-        violations = hard_constraint_violations(c)
-        if violations:
-            rejected.append(
-                RouteEvaluation(
-                    hard_constraint_status=HardConstraintStatus.REJECTED,
-                    rejection_reasons=tuple(r for r, _ in violations),
-                    rejection_details=tuple(d for _, d in violations),
-                    **common,
-                )
-            )
-            continue
-        score = score_route(
-            ScoringInput(
-                route_id=c.route_id,
-                reliability=c.quote.quoted_reliability,
-                incremental_fee_gbp=c.quote.incremental_fee.amount,
-                latency_seconds=c.quote.expected_latency_seconds,
-                dependency_count=c.rail.dependency_count,
-            )
-        )
-        scored.append((score, c, common))
+def verify_evaluations(
+    candidates: tuple[CandidateRecoveryRoute, ...],
+    evaluations: tuple[RouteEvaluation, ...],
+) -> list[str]:
+    """Re-derive everything except the Monte Carlo statistics. Empty list = trustworthy.
 
-    # Deterministic ordering: score desc, then cheaper, then faster, then route id.
-    scored.sort(
-        key=lambda s: (
-            -s[0].total,
-            s[1].quote.incremental_fee.amount,
-            s[1].quote.expected_latency_seconds,
-            s[1].route_id,
-        )
-    )
-    passed = [
-        RouteEvaluation(
-            hard_constraint_status=HardConstraintStatus.PASSED,
-            score=score,
-            rank=rank,
-            **common,
-        )
-        for rank, (score, _, common) in enumerate(scored, start=1)
-    ]
-    return (*passed, *rejected)
+    A compute backend can therefore never admit a policy-denied / down / incompatible /
+    illiquid route, alter a fee, or change a score or rank: only simulated statistics are
+    taken from it, and those feed the locally recomputed score.
+    """
+    by_route = {e.route_id: e for e in evaluations}
+    if len(by_route) != len(evaluations) or set(by_route) != {c.route_id for c in candidates}:
+        return ["evaluations do not correspond one-to-one with the candidates"]
+    problems: list[str] = []
+    passing: list[tuple[tuple, int]] = []
+    for c in candidates:
+        e = by_route[c.route_id]
+        rail_id = c.rail.rail_id
+        expected = tuple(reason for reason, _ in hard_constraint_violations(c))
+        if e.rail_id is not rail_id or e.rejection_reasons != expected:
+            problems.append(f"{rail_id}: hard-constraint result differs from local check")
+            continue
+        if e.estimated_incremental_cost != c.quote.incremental_fee:
+            problems.append(f"{rail_id}: incremental fee differs from the quote")
+        if e.passed:
+            recomputed = score_route(scoring_input(c, e.scenario_results[0]))
+            if recomputed != e.score:
+                problems.append(f"{rail_id}: score differs from local recomputation")
+            assert e.rank is not None
+            passing.append((ranking_key(recomputed.total, c), e.rank))
+    ranks_in_expected_order = [rank for _, rank in sorted(passing)]
+    if ranks_in_expected_order != list(range(1, len(passing) + 1)):
+        problems.append("ranking differs from local recomputation")
+    return problems

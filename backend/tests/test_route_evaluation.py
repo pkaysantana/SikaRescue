@@ -24,8 +24,8 @@ def _by_rail(evaluations):
     return {e.rail_id: e for e in evaluations}
 
 
-def test_seeded_evaluation_outcome(world, txn_id):
-    evaluations = world.service.evaluate_recovery_routes(txn_id)
+async def test_seeded_evaluation_outcome(world, txn_id):
+    evaluations = await world.service.evaluate_recovery_routes(txn_id)
     by_rail = _by_rail(evaluations)
     assert set(by_rail) == {RailId.MOMO_A, RailId.MOMO_B, RailId.BANK_MOMO_BRIDGE,
                             RailId.TOKEN_BRIDGE}  # fmt: skip
@@ -34,8 +34,8 @@ def test_seeded_evaluation_outcome(world, txn_id):
     assert by_rail[RailId.MOMO_B].score.total > by_rail[RailId.BANK_MOMO_BRIDGE].score.total
 
 
-def test_token_bridge_rejected_by_policy(world, txn_id):  # 3
-    token = _by_rail(world.service.evaluate_recovery_routes(txn_id))[RailId.TOKEN_BRIDGE]
+async def test_token_bridge_rejected_by_policy(world, txn_id):  # 3
+    token = _by_rail(await world.service.evaluate_recovery_routes(txn_id))[RailId.TOKEN_BRIDGE]
     assert not token.passed
     assert token.rejection_reasons == (RejectionReason.POLICY_DENIED,)
     assert "POL-001" in token.rejection_details[0]
@@ -44,11 +44,11 @@ def test_token_bridge_rejected_by_policy(world, txn_id):  # 3
     assert not decision.permitted and [d.rule_id for d in decision.denials] == ["POL-001"]
 
 
-def test_down_rail_cannot_be_selected(world, txn_id):  # 4
-    by_rail = _by_rail(world.service.evaluate_recovery_routes(txn_id))
+async def test_down_rail_cannot_be_selected(world, txn_id):  # 4
+    by_rail = _by_rail(await world.service.evaluate_recovery_routes(txn_id))
     assert RejectionReason.RAIL_UNAVAILABLE in by_rail[RailId.MOMO_A].rejection_reasons
     world.registry.set_status(RailId.MOMO_B, RailStatus.DOWN)
-    by_rail = _by_rail(world.service.evaluate_recovery_routes(txn_id))
+    by_rail = _by_rail(await world.service.evaluate_recovery_routes(txn_id))
     assert by_rail[RailId.MOMO_B].rejection_reasons == (RejectionReason.RAIL_UNAVAILABLE,)
     assert [e.rail_id for e in by_rail.values() if e.passed] == [RailId.BANK_MOMO_BRIDGE]
 
@@ -87,7 +87,7 @@ async def test_incompatible_rail_cannot_be_selected(world, txn_id):  # 5
     world.registry.replace_rail(
         momo_b.model_copy(update={"supported_endpoints": frozenset({EndpointType.BANK_ACCOUNT})})
     )
-    by_rail = _by_rail(world.service.evaluate_recovery_routes(txn_id))
+    by_rail = _by_rail(await world.service.evaluate_recovery_routes(txn_id))
     assert by_rail[RailId.MOMO_B].rejection_reasons == (RejectionReason.RECIPIENT_INCOMPATIBLE,)
     plan = await world.service.create_recovery_plan(txn_id)
     assert plan.rail_id is RailId.BANK_MOMO_BRIDGE
@@ -97,7 +97,7 @@ async def test_insufficient_liquidity_cannot_be_selected(world, txn_id):  # 6
     world.liquidity.set_balance(RailId.MOMO_B, Money.of("1000.00", Currency.GHS))
     liquidity = world.service.check_liquidity(txn_id, RailId.MOMO_B)
     assert not liquidity.sufficient
-    by_rail = _by_rail(world.service.evaluate_recovery_routes(txn_id))
+    by_rail = _by_rail(await world.service.evaluate_recovery_routes(txn_id))
     assert by_rail[RailId.MOMO_B].rejection_reasons == (RejectionReason.INSUFFICIENT_LIQUIDITY,)
     plan = await world.service.create_recovery_plan(txn_id)
     assert plan.rail_id is RailId.BANK_MOMO_BRIDGE

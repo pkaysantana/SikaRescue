@@ -27,6 +27,7 @@ from sikarescue.models.enums import (
     RecoveryState,
 )
 from sikarescue.models.routes import CandidateRecoveryRoute, RouteEvaluation, route_id_for
+from sikarescue.models.simulation import ComputeRunSummary
 from sikarescue.models.transaction import OutstandingObligation
 
 ApproverId = Annotated[str, StringConstraints(pattern=r"^[a-z0-9._@-]{2,64}$")]
@@ -126,6 +127,9 @@ class RecoveryPlan(DomainModel):
     supersedes_plan_id: EntityId | None = None
     selection_reasons: tuple[str, ...] = ()
     evaluations: tuple[RouteEvaluation, ...] = Field(min_length=1)
+    # Provenance of the (synthetic) compute run behind `evaluations`. Not part of the hash:
+    # it explains the choice; the hashed fields define what would be executed.
+    compute: ComputeRunSummary | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
     @classmethod

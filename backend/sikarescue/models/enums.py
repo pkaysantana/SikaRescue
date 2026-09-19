@@ -130,6 +130,17 @@ class RejectionReason(StrEnum):
     FAILED_EARLIER_FOR_TRANSACTION = "FAILED_EARLIER_FOR_TRANSACTION"
 
 
+class ScenarioId(StrEnum):
+    """Synthetic operating regimes for route reliability simulation."""
+
+    NORMAL = "NORMAL"
+    CONGESTION = "CONGESTION"
+    RAIL_DEGRADATION = "RAIL_DEGRADATION"
+    LATENCY_SPIKE = "LATENCY_SPIKE"
+    REGIONAL_DISRUPTION = "REGIONAL_DISRUPTION"
+    CORRELATED_FAILURE = "CORRELATED_FAILURE"
+
+
 class HardConstraintStatus(StrEnum):
     PASSED = "PASSED"
     REJECTED = "REJECTED"

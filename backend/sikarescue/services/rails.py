@@ -5,14 +5,28 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from sikarescue.errors import NotFoundError
-from sikarescue.models import FundsLocation, Rail, RailId, RailQuote, RailStatus
+from sikarescue.models import (
+    FundsLocation,
+    Rail,
+    RailId,
+    RailQuote,
+    RailStatus,
+    RouteSimulationProfile,
+)
 from sikarescue.models.enums import PAYOUT_RAIL_TYPES
 
 
 class RailRegistry:
-    def __init__(self, rails: Iterable[Rail], quotes: Iterable[RailQuote]):
+    def __init__(
+        self,
+        rails: Iterable[Rail],
+        quotes: Iterable[RailQuote],
+        profiles: Iterable[RouteSimulationProfile],
+    ):
         self._rails = {r.rail_id: r for r in rails}
         self._quotes = {q.rail_id: q for q in quotes}
+        # Synthetic behaviour model of each payout rail, used only by the simulation.
+        self._profiles = {p.rail_id: p for p in profiles}
 
     def get(self, rail_id: RailId) -> Rail:
         try:
@@ -35,6 +49,12 @@ class RailRegistry:
             return self._quotes[rail_id]
         except KeyError:
             raise NotFoundError(f"no quote for rail {rail_id}") from None
+
+    def simulation_profile(self, rail_id: RailId) -> RouteSimulationProfile:
+        try:
+            return self._profiles[rail_id]
+        except KeyError:
+            raise NotFoundError(f"no simulation profile for rail {rail_id}") from None
 
     # --- demo / test controls: simulate the outside world changing -----------------------
 

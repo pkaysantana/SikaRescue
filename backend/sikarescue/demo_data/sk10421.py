@@ -16,6 +16,8 @@ from decimal import Decimal
 
 from pydantic import SecretStr
 
+from sikarescue.compute.backend import LocalRouteComputeBackend, RouteComputeBackend
+from sikarescue.compute.scenarios import simulation_config
 from sikarescue.models import (
     Actor,
     AttemptOutcome,
@@ -27,6 +29,7 @@ from sikarescue.models import (
     FailureStage,
     FinancialEffect,
     FundsLocation,
+    HopProfile,
     Money,
     OperationAttempt,
     OperationType,
@@ -37,6 +40,8 @@ from sikarescue.models import (
     RailStatus,
     RailType,
     RecipientDetails,
+    RouteSimulationProfile,
+    SimulationConfig,
     effect_key,
 )
 from sikarescue.models.enums import OPERATION_FLOW
@@ -141,6 +146,41 @@ def build_quotes() -> list[RailQuote]:
         q(3, RailId.BANK_MOMO_BRIDGE, "0.42", 41, 0.964),
         # Cheapest, fastest and best-quoted -- but not permitted by corridor policy.
         q(4, RailId.TOKEN_BRIDGE, "0.09", 25, 0.990),
+    ]
+
+
+def build_simulation_profiles() -> list[RouteSimulationProfile]:
+    """SYNTHETIC behaviour model per payout rail (one hop per external dependency).
+
+    Tuned so the NORMAL scenario lands near each rail's quoted reliability
+    (MOMO_B ~98.1%, BANK_MOMO_BRIDGE ~96.4%). Illustrative only, not measured.
+    """
+
+    def hop(name: str, failure: float, median: float, sigma: float = 0.25) -> HopProfile:
+        return HopProfile(
+            name=name,
+            failure_probability=failure,
+            median_latency_seconds=median,
+            latency_sigma=sigma,
+            outage_probability=0.02,
+            outage_delay_seconds=45.0,
+            retry_failure_probability=0.25,
+        )
+
+    return [
+        RouteSimulationProfile(rail_id=RailId.MOMO_A, hops=(hop("momo_a_payout", 0.03, 60.0),)),
+        RouteSimulationProfile(rail_id=RailId.MOMO_B, hops=(hop("momo_b_payout", 0.014, 70.0),)),
+        RouteSimulationProfile(
+            rail_id=RailId.BANK_MOMO_BRIDGE,
+            hops=(
+                hop("gh_bank_transfer", 0.013, 18.0, sigma=0.3),
+                hop("bank_to_momo_push", 0.013, 20.0, sigma=0.3),
+            ),
+        ),
+        RouteSimulationProfile(
+            rail_id=RailId.TOKEN_BRIDGE,
+            hops=(hop("token_mint", 0.005, 10.0), hop("token_offramp", 0.005, 14.0)),
+        ),
     ]
 
 
@@ -280,12 +320,13 @@ def build_demo_world(
     *,
     payout_latency_seconds: float = 0.0,
     momo_a_outcome: AttemptOutcome = AttemptOutcome.DEFINITIVE_FAILED,
-    compute_backend: str = "local",
+    compute: RouteComputeBackend | None = None,
+    simulation: SimulationConfig | None = None,
     payout_timeout_seconds: float = 30.0,
 ) -> DemoWorld:
     repository = InMemoryTransactionRepository()
     repository.add(seed_transaction(momo_a_outcome))
-    registry = RailRegistry(build_rails(), build_quotes())
+    registry = RailRegistry(build_rails(), build_quotes(), build_simulation_profiles())
     policy = build_policy()
     liquidity = build_liquidity()
     gateway = SimulatedPayoutGateway(latency_seconds=payout_latency_seconds)
@@ -295,7 +336,8 @@ def build_demo_world(
         policy,
         liquidity,
         gateway,
-        compute_backend=compute_backend,
+        compute=compute or LocalRouteComputeBackend(),
+        simulation_config=simulation or simulation_config(),
         payout_timeout_seconds=payout_timeout_seconds,
     )
     return DemoWorld(repository, registry, policy, liquidity, gateway, service)

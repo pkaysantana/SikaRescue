@@ -59,5 +59,7 @@ class ModelRouteView(DomainModel):
     expected_latency_seconds: int
     quoted_reliability: Probability
     simulated_success_probability: Probability | None
+    simulated_within_sla_probability: Probability | None
+    p95_latency_seconds: float | None
     score: float | None
     rank: int | None

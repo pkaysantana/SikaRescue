@@ -10,9 +10,11 @@ import asyncio
 from contextlib import suppress
 from typing import NoReturn
 
+from sikarescue.compute.backend import RouteComputeBackend
 from sikarescue.errors import (
     ApprovalMismatchError,
     ApprovalRequiredError,
+    ComputeIntegrityError,
     ExecutionConflictError,
     IllegalTransitionError,
     ManualReviewRequiredError,
@@ -57,6 +59,9 @@ from sikarescue.models import (
     RecoveryPlan,
     RecoveryState,
     RouteEvaluation,
+    RouteEvaluationBatch,
+    RouteEvaluationRequest,
+    SimulationConfig,
     TransactionState,
     effect_key,
     new_id,
@@ -82,7 +87,7 @@ from sikarescue.services.routes import (
     build_candidate,
     discover_candidates,
     eligibility_of,
-    evaluate_routes,
+    verify_evaluations,
 )
 from sikarescue.services.state_machine import PLANNABLE_STATES, assert_transition
 
@@ -115,7 +120,8 @@ class RecoveryService:
         liquidity: LiquidityBook,
         gateway: SimulatedPayoutGateway,
         *,
-        compute_backend: str = "local",
+        compute: RouteComputeBackend,
+        simulation_config: SimulationConfig,
         payout_timeout_seconds: float = 30.0,
     ):
         self.repository = repository
@@ -123,8 +129,13 @@ class RecoveryService:
         self.policy = policy
         self.liquidity = liquidity
         self.gateway = gateway
-        self.compute_backend = compute_backend
+        self.compute = compute
+        self.simulation_config = simulation_config
         self.payout_timeout_seconds = payout_timeout_seconds
+
+    @property
+    def compute_backend(self) -> str:
+        return self.compute.name
 
     # ===================================================================== read tools
 
@@ -153,8 +164,25 @@ class RecoveryService:
             aggregate, obligation, self.registry, self.policy, self.liquidity
         )
 
-    def evaluate_recovery_routes(self, transaction_id: str) -> tuple[RouteEvaluation, ...]:
-        return evaluate_routes(self.discover_recovery_routes(transaction_id), self.compute_backend)
+    async def evaluate_recovery_routes(self, transaction_id: str) -> tuple[RouteEvaluation, ...]:
+        """Read-only evaluation of the current candidates (no plan is created)."""
+        candidates = self.discover_recovery_routes(transaction_id)
+        batch = await self._run_compute(transaction_id, candidates)
+        problems = verify_evaluations(candidates, batch.evaluations)
+        if problems:
+            raise ComputeIntegrityError(problems)
+        return batch.evaluations
+
+    async def _run_compute(
+        self, transaction_id: str, candidates: tuple[CandidateRecoveryRoute, ...]
+    ) -> RouteEvaluationBatch:
+        request = RouteEvaluationRequest(
+            request_id=new_id("cmp"),
+            transaction_id=transaction_id,
+            candidates=candidates,
+            config=self.simulation_config,
+        )
+        return await self.compute.evaluate(request)
 
     def get_plan(self, plan_id: str) -> RecoveryPlan:
         return self.repository.get_by_plan(plan_id)[1]
@@ -262,25 +290,22 @@ class RecoveryService:
             captured_at=utcnow(),
         )
 
-    async def _evaluate_snapshot(self, snapshot: PlanningSnapshot) -> tuple[RouteEvaluation, ...]:
-        """Phase B: pure evaluation of an immutable snapshot. Never holds the lock.
-
-        This is the seam where the compute backend (local / Modal) plugs in.
-        """
-        return evaluate_routes(snapshot.candidates, self.compute_backend)
+    async def _evaluate_snapshot(self, snapshot: PlanningSnapshot) -> RouteEvaluationBatch:
+        """Phase B: evaluate an immutable snapshot on the compute backend. Never holds the lock."""
+        return await self._run_compute(snapshot.transaction_id, snapshot.candidates)
 
     async def _plan_from_snapshot(
         self, aggregate: TransactionAggregate, snapshot: PlanningSnapshot
     ) -> RecoveryPlan:
-        evaluations = await self._evaluate_snapshot(snapshot)
+        batch = await self._evaluate_snapshot(snapshot)
         async with aggregate.lock:
-            return self._commit_plan(aggregate, snapshot, evaluations)
+            return self._commit_plan(aggregate, snapshot, batch)
 
     def _commit_plan(
         self,
         aggregate: TransactionAggregate,
         snapshot: PlanningSnapshot,
-        evaluations: tuple[RouteEvaluation, ...],
+        batch: RouteEvaluationBatch,
     ) -> RecoveryPlan:
         """Phase C (caller holds the lock): persist only if the snapshot is still true."""
         if aggregate.current_plan_id != snapshot.superseded_plan_id:
@@ -295,7 +320,13 @@ class RecoveryService:
         drift = self._snapshot_drift(aggregate, snapshot)
         if drift:
             self._discard_planning_result(aggregate, drift)
+        # Never trust a compute backend blindly: re-derive constraints, money, scores, ranks.
+        problems = verify_evaluations(snapshot.candidates, batch.evaluations)
+        if problems:
+            self._discard_planning_result(aggregate, problems, ComputeIntegrityError(problems))
 
+        evaluations = batch.evaluations
+        summary = batch.summary
         passing = [e for e in evaluations if e.passed]
         rejected = [e for e in evaluations if not e.passed]
         aggregate.record_audit(
@@ -304,7 +335,10 @@ class RecoveryService:
             f"{len(rejected)} rejected by hard constraints, {len(passing)} scored",
             evaluated=len(passing),
             rejected=len(rejected),
-            compute_backend=self.compute_backend,
+            compute_backend=summary.backend,
+            simulated_trials=summary.simulated_trials,
+            compute_elapsed_ms=round(summary.elapsed_seconds * 1000, 1),
+            seed=summary.seed,
             **{
                 f"rejected_{e.rail_id.value}": ",".join(r.value for r in e.rejection_reasons)
                 for e in rejected
@@ -349,6 +383,7 @@ class RecoveryService:
                 candidate, best, passing, obligation.endpoint_type
             ),
             evaluations=evaluations,
+            compute=summary,
         )
         aggregate.plans[plan.plan_id] = plan
         aggregate.plan_status[plan.plan_id] = PlanStatus.PENDING_APPROVAL
@@ -413,13 +448,15 @@ class RecoveryService:
         return list(dict.fromkeys(reasons))
 
     @staticmethod
-    def _discard_planning_result(aggregate: TransactionAggregate, reasons: list[str]) -> NoReturn:
+    def _discard_planning_result(
+        aggregate: TransactionAggregate, reasons: list[str], error: Exception | None = None
+    ) -> NoReturn:
         aggregate.record_audit(
             AuditEventType.PLANNING_RESULT_DISCARDED,
             ENGINE,
             f"Route evaluation discarded, nothing persisted: {'; '.join(reasons)}"[:280],
         )
-        raise StalePlanningResultError(reasons)
+        raise error or StalePlanningResultError(reasons)
 
     @staticmethod
     def _selection_reasons(
@@ -508,7 +545,7 @@ class RecoveryService:
         replacement: str | None = None
         if snapshot is not None:
             # Never silently substitute: the replacement is a NEW plan needing fresh approval.
-            with suppress(NoEligibleRouteError, StalePlanningResultError):
+            with suppress(NoEligibleRouteError, StalePlanningResultError, ComputeIntegrityError):
                 replacement = (await self._plan_from_snapshot(aggregate, snapshot)).plan_id
         raise StalePlanError(plan.plan_id, reasons, replacement)
 

@@ -43,8 +43,8 @@ def test_model_view_rejects_added_pii_fields(world, txn_id):
         ModelTransactionView(**view.model_dump(), recipient_name=RECIPIENT_NAME)
 
 
-def test_route_views_are_serialisable_and_pii_free(world, txn_id):
-    views = build_model_route_views(world.service.evaluate_recovery_routes(txn_id))
+async def test_route_views_are_serialisable_and_pii_free(world, txn_id):
+    views = build_model_route_views(await world.service.evaluate_recovery_routes(txn_id))
     token = next(v for v in views if v.rail_id == "TOKEN_BRIDGE")
     assert token.rejection_reasons == (RejectionReason.POLICY_DENIED,)
     payload = "".join(v.model_dump_json() for v in views)
