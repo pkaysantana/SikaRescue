@@ -21,6 +21,7 @@ from sikarescue.compute.backend import (
 from sikarescue.compute.modal_backend import ModalRouteComputeBackend
 from sikarescue.compute.scenarios import STRESS_SCENARIOS, workload_config
 from sikarescue.compute.shards import ShardSpec, run_shard
+from sikarescue.config import Settings
 from sikarescue.demo_data.sk10421 import TRANSACTION_ID, build_demo_world
 from sikarescue.errors import ComputeIntegrityError
 from sikarescue.models import (
@@ -279,6 +280,14 @@ def test_modal_backend_is_built_lazily_without_network():
     assert isinstance(backend, FallbackComputeBackend)
     assert backend.timeout_seconds == 7 and backend.primary.shards_per_scenario == 3
     assert backend.primary._remote is None  # no Modal lookup until the first evaluation
+
+
+def test_modal_timeout_defaults_to_15s_and_env_overrides(monkeypatch):
+    monkeypatch.delenv("SIKARESCUE_MODAL_TIMEOUT_SECONDS", raising=False)
+    assert Settings(_env_file=None).modal_timeout_seconds == 15.0
+    assert build_compute_backend("modal").timeout_seconds == 15.0
+    monkeypatch.setenv("SIKARESCUE_MODAL_TIMEOUT_SECONDS", "9.5")
+    assert Settings(_env_file=None).modal_timeout_seconds == 9.5
 
 
 async def test_cli_shows_modal_fanout_and_reconciles(txn_id):

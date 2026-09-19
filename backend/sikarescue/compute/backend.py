@@ -28,7 +28,7 @@ from sikarescue.models import ComputeRunSummary, RouteEvaluationBatch, RouteEval
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_REMOTE_TIMEOUT_SECONDS = 60.0
+DEFAULT_REMOTE_TIMEOUT_SECONDS = 15.0
 
 
 class RouteComputeBackend(ABC):

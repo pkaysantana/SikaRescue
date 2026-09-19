@@ -89,7 +89,7 @@ simulation.
 ### Fallback: Modal is never a single point of failure
 
 `SIKARESCUE_COMPUTE_BACKEND=modal` builds `FallbackComputeBackend(Modal → Local)` with a
-30 s timeout. On timeout, authentication/lookup failure, remote exception, unavailability or
+15 s timeout (override: `SIKARESCUE_MODAL_TIMEOUT_SECONDS`). On timeout, authentication/lookup failure, remote exception, unavailability or
 a result that fails verification, the local backend evaluates the same request and the
 plan's compute summary says so explicitly: `backend=local, fallback_from=modal,
 fallback_reason=…`. A `COMPUTE_FALLBACK` audit event is also recorded. The recovery flow then

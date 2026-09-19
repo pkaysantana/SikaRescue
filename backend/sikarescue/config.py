@@ -25,7 +25,8 @@ class Settings(BaseSettings):
     simulation_workload: Literal["quick", "stress"] | None = None
     simulation_trials_per_scenario: int | None = Field(default=None, ge=100, le=1_000_000)
     # Modal compute (Phase 4). Any failure or timeout falls back to local compute, visibly.
-    modal_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    # ~15 s: comfortably above a measured ~10.5 s cold start, short enough for a live demo.
+    modal_timeout_seconds: float = Field(default=15.0, gt=0, le=600)
     modal_shards_per_scenario: int = Field(default=2, ge=1, le=16)
 
     @property
