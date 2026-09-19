@@ -10,6 +10,7 @@ import asyncio
 from contextlib import suppress
 from typing import NoReturn
 
+from sikarescue import telemetry
 from sikarescue.compute.backend import RouteComputeBackend
 from sikarescue.errors import (
     ApprovalMismatchError,
@@ -182,7 +183,41 @@ class RecoveryService:
             candidates=candidates,
             config=self.simulation_config,
         )
-        return await self.compute.evaluate(request)
+        configured = self.compute.name
+        with telemetry.span(
+            "route_compute",
+            transaction_id=transaction_id,
+            configured_backend=configured,
+            candidate_routes=len(candidates),
+        ) as span:
+            telemetry.event(
+                f"{configured}_compute_started",
+                transaction_id=transaction_id,
+                compute_backend=configured,
+                scenarios=len(self.simulation_config.scenarios),
+                trials_per_scenario=self.simulation_config.trials_per_scenario,
+            )
+            batch = await self.compute.evaluate(request)
+            summary = batch.summary
+            facts = {
+                "compute_backend": summary.backend,
+                "parallel_jobs": summary.parallel_jobs,
+                "simulation_count": summary.simulated_trials,
+                "routes_simulated": summary.routes_simulated,
+                "compute_elapsed_ms": round(summary.elapsed_seconds * 1000, 1),
+                "remote_compute_seconds": summary.remote_compute_seconds,
+                "fallback_used": summary.fallback_from is not None,
+                "fallback_from": summary.fallback_from,
+                "fallback_reason": summary.fallback_reason,
+            }
+            span.set(**facts)
+            telemetry.event(
+                f"{configured}_compute_finished",
+                level="warn" if summary.fallback_from else "info",
+                transaction_id=transaction_id,
+                **facts,
+            )
+        return batch
 
     def get_plan(self, plan_id: str) -> RecoveryPlan:
         return self.repository.get_by_plan(plan_id)[1]
@@ -209,6 +244,18 @@ class RecoveryService:
         Idempotent while the current plan is still fresh: returns it instead of a new one.
         Route evaluation runs WITHOUT the transaction lock (see `_plan_from_snapshot`).
         """
+        with telemetry.span("recovery_planning", transaction_id=transaction_id) as span:
+            plan = await self._create_recovery_plan(transaction_id)
+            span.set(
+                plan_id=plan.plan_id,
+                transaction_revision=plan.expected_revision,
+                selected_route=plan.rail_id.value,
+                rejected_route_count=sum(1 for e in plan.evaluations if not e.passed),
+                compute_backend=plan.compute.backend if plan.compute else None,
+            )
+            return plan
+
+    async def _create_recovery_plan(self, transaction_id: str) -> RecoveryPlan:
         aggregate = self.repository.get(transaction_id)
         async with aggregate.lock:
             current = aggregate.current_plan
@@ -228,6 +275,32 @@ class RecoveryService:
     async def request_recovery_approval(self, plan_id: str) -> ApprovalRequest:
         """Every plan requires approval; the request is created with the plan."""
         return self.get_approval_request(plan_id)
+
+    async def record_recovery_advice(
+        self,
+        transaction_id: str,
+        *,
+        plan_id: str,
+        orchestrator: str,
+        actor: Actor,
+        model: str | None = None,
+        fallback_reason: str | None = None,
+    ) -> None:
+        """Narrative only: record who explained the plan. Touches no financial or plan state."""
+        aggregate = self.repository.get(transaction_id)
+        async with aggregate.lock:
+            aggregate.record_audit(
+                AuditEventType.RECOVERY_ADVICE_GENERATED,
+                actor,
+                (
+                    f"Recovery advice for plan {plan_id} by {orchestrator}"
+                    + (f" ({fallback_reason})" if fallback_reason else "")
+                )[:280],
+                plan_id=plan_id,
+                orchestrator=orchestrator,
+                model=model,
+                fallback_reason=fallback_reason[:200] if fallback_reason else None,
+            )
 
     # Planning runs in three phases so slow (future: remote) compute never holds the lock:
     #   A. under the lock:   capture a PlanningSnapshot       (_capture_planning_snapshot)
@@ -677,6 +750,17 @@ class RecoveryService:
         If we cannot prove whether value moved (cancellation, timeout, transport error) the
         outcome is UNKNOWN -> MANUAL_REVIEW: never DEFINITIVE_FAILED, never retried.
         """
+        with telemetry.span("recovery_execution", plan_id=plan_id) as span:
+            result = await self._execute_recovery(plan_id)
+            span.set(
+                transaction_id=result.transaction_id,
+                selected_route=result.rail_id.value,
+                execution_status=result.status.value,
+                replayed=result.replayed,
+            )
+            return result
+
+    async def _execute_recovery(self, plan_id: str) -> ExecutionResult:
         aggregate, plan = self.repository.get_by_plan(plan_id)
         key = payout_execution_key(plan.transaction_id, plan.plan_id)
 
@@ -783,6 +867,31 @@ class RecoveryService:
         request: PayoutRequest,
     ) -> PayoutResponse:
         """Call the provider without the lock. Anything short of a provider answer is UNKNOWN."""
+        facts = {
+            "transaction_id": plan.transaction_id,
+            "plan_id": plan.plan_id,
+            "execution_id": execution.execution_id,
+            "selected_route": plan.rail_id.value,
+        }
+        with telemetry.span("payout", **facts) as span:
+            telemetry.event("payout_started", **facts)
+            response = await self._submit_payout(aggregate, plan, execution, request)
+            span.set(payout_outcome=response.outcome.value)
+            telemetry.event(
+                "payout_completed",
+                level="info" if response.outcome is AttemptOutcome.SUCCEEDED else "warn",
+                payout_outcome=response.outcome.value,
+                **facts,
+            )
+            return response
+
+    async def _submit_payout(
+        self,
+        aggregate: TransactionAggregate,
+        plan: RecoveryPlan,
+        execution: ExecutionResult,
+        request: PayoutRequest,
+    ) -> PayoutResponse:
         try:
             return await asyncio.wait_for(
                 self.gateway.submit(request), timeout=self.payout_timeout_seconds
@@ -920,6 +1029,18 @@ class RecoveryService:
 
     async def reconcile_transaction(self, transaction_id: str) -> ReconciliationResult:
         """Prove the transaction is complete and correct; only then enter RECONCILED."""
+        with telemetry.span("reconciliation", transaction_id=transaction_id) as span:
+            result = await self._reconcile_transaction(transaction_id)
+            span.set(
+                reconciled=result.reconciled,
+                state=result.final_state.value,
+                sender_debit_count=result.sender_debit_count,
+                recipient_credit_count=result.recipient_credit_count,
+                duplicate_sender_debits=result.duplicate_sender_debits,
+            )
+            return result
+
+    async def _reconcile_transaction(self, transaction_id: str) -> ReconciliationResult:
         aggregate = self.repository.get(transaction_id)
         async with aggregate.lock:
             if aggregate.reconciliation is not None and aggregate.reconciliation.reconciled:

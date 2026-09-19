@@ -90,8 +90,17 @@ async def test_cli_unknown_payout_cannot_auto_recover(txn_id):
     assert "No automatic retry or reroute" in text
 
 
-def _run_script(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
-    env = os.environ | {"SIKARESCUE_PAYOUT_LATENCY_SECONDS": "0", "PYTHONIOENCODING": "utf-8"}
+def _run_script(
+    tmp_path: Path, *args: str, stdin: str | None = None
+) -> subprocess.CompletedProcess:
+    # Offline and isolated: no .env (cwd), no credentials, no model, no Modal, no export.
+    secrets = ("PYDANTIC_AI_GATEWAY_API_KEY", "PAIG_API_KEY", "LOGFIRE_TOKEN")
+    env = {k: v for k, v in os.environ.items() if k not in secrets} | {
+        "SIKARESCUE_PAYOUT_LATENCY_SECONDS": "0",
+        "SIKARESCUE_AGENT_MODE": "deterministic",
+        "SIKARESCUE_COMPUTE_BACKEND": "local",
+        "PYTHONIOENCODING": "utf-8",
+    }
     return subprocess.run(
         [sys.executable, str(REPO_ROOT / "scripts" / "demo_recovery.py"), *args],
         input=stdin,
@@ -99,21 +108,21 @@ def _run_script(*args: str, stdin: str | None = None) -> subprocess.CompletedPro
         text=True,
         encoding="utf-8",
         env=env,
-        cwd=REPO_ROOT,
+        cwd=tmp_path,
         timeout=120,
     )
 
 
-def test_script_end_to_end_with_approve_flag():
-    result = _run_script("--approve", "--no-timeline")
+def test_script_end_to_end_with_approve_flag(tmp_path):
+    result = _run_script(tmp_path, "--approve", "--no-timeline")
     assert result.returncode == 0, result.stderr
     assert "state                    : RECONCILED" in result.stdout
     assert "sender debit count       : 1" in result.stdout
     assert "recipient credit count   : 1" in result.stdout
 
 
-def test_script_interactive_prompt_accepts_typed_answer():
-    result = _run_script(stdin="y\n")
+def test_script_interactive_prompt_accepts_typed_answer(tmp_path):
+    result = _run_script(tmp_path, stdin="y\n")
     assert result.returncode == 0, result.stderr
     assert "Operator answered: approve" in result.stdout
     assert "Audit timeline" in result.stdout

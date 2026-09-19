@@ -1,10 +1,12 @@
 """Pydantic domain models. Import from here: `from sikarescue.models import RecoveryPlan`."""
 
+from sikarescue.models.advice import RecoveryAdvice, RejectedRouteAdvice
 from sikarescue.models.audit import AuditEvent
 from sikarescue.models.common import DomainModel, Money, new_id, utcnow
 from sikarescue.models.compute import RouteEvaluationBatch, RouteEvaluationRequest
 from sikarescue.models.enums import (
     Actor,
+    AdviceReasonCode,
     AttemptOutcome,
     AuditEventType,
     CountryCode,
@@ -39,7 +41,23 @@ from sikarescue.models.ledger import (
     effect_key,
     payout_execution_key,
 )
-from sikarescue.models.model_views import ModelLegView, ModelRouteView, ModelTransactionView
+from sikarescue.models.model_views import (
+    CompletedEffectView,
+    ComputeView,
+    DecisionRouteView,
+    FailureView,
+    ModelAuditEntryView,
+    ModelAuditSummary,
+    ModelLegView,
+    ModelPlanView,
+    ModelRouteView,
+    ModelTransactionView,
+    ObligationView,
+    RecoveryDecisionContext,
+    RejectedRouteView,
+    SelectedPlanView,
+    StressResultView,
+)
 from sikarescue.models.rails import (
     LiquidityStatus,
     PolicyDecision,
@@ -81,6 +99,7 @@ from sikarescue.models.transaction import (
 
 __all__ = [
     "Actor",
+    "AdviceReasonCode",
     "ApprovalDecision",
     "ApprovalRequest",
     "AttemptOutcome",
@@ -88,9 +107,12 @@ __all__ = [
     "AuditEvent",
     "AuditEventType",
     "CandidateRecoveryRoute",
+    "CompletedEffectView",
     "ComputeRunSummary",
+    "ComputeView",
     "CountryCode",
     "Currency",
+    "DecisionRouteView",
     "DomainModel",
     "EffectPosted",
     "EligibilitySnapshot",
@@ -101,6 +123,7 @@ __all__ = [
     "ExecutionStatus",
     "FailureDetail",
     "FailureStage",
+    "FailureView",
     "FeeBearer",
     "FinancialEffect",
     "FundsLocation",
@@ -108,10 +131,14 @@ __all__ = [
     "HopProfile",
     "JournalEntry",
     "LiquidityStatus",
+    "ModelAuditEntryView",
+    "ModelAuditSummary",
     "ModelLegView",
+    "ModelPlanView",
     "ModelRouteView",
     "ModelTransactionView",
     "Money",
+    "ObligationView",
     "OperatingScenario",
     "OperationAttempt",
     "OperationType",
@@ -131,8 +158,12 @@ __all__ = [
     "ReconciliationCheck",
     "ReconciliationCompleted",
     "ReconciliationResult",
+    "RecoveryAdvice",
+    "RecoveryDecisionContext",
     "RecoveryPlan",
     "RecoveryState",
+    "RejectedRouteAdvice",
+    "RejectedRouteView",
     "RejectionReason",
     "RouteEvaluation",
     "RouteEvaluationBatch",
@@ -141,9 +172,11 @@ __all__ = [
     "RouteSimulationResult",
     "ScenarioId",
     "ScoreBreakdown",
+    "SelectedPlanView",
     "SettlementLeg",
     "SettlementLegStatus",
     "SimulationConfig",
+    "StressResultView",
     "TransactionState",
     "effect_key",
     "new_id",

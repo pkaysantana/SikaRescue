@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
+from sikarescue import telemetry
 from sikarescue.errors import NotFoundError
 from sikarescue.models import (
     Actor,
@@ -79,6 +80,7 @@ class TransactionAggregate:
             data=data,
         )
         self.audit.append(event)
+        telemetry.record_audit_event(event)  # never raises
         return event
 
     def transition(self, target: RecoveryState, *, actor: Actor, reason: str) -> None:

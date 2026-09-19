@@ -1,11 +1,15 @@
-"""Runtime configuration from environment variables (prefix `SIKARESCUE_`) or `.env`."""
+"""Runtime configuration from environment variables (prefix `SIKARESCUE_`) or `.env`.
+
+Third-party credentials keep their vendors' own unprefixed names (PYDANTIC_AI_GATEWAY_API_KEY,
+LOGFIRE_TOKEN, ...) and are held as `SecretStr`, so they are never printed or logged.
+"""
 
 from __future__ import annotations
 
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,6 +32,32 @@ class Settings(BaseSettings):
     # ~15 s: comfortably above a measured ~10.5 s cold start, short enough for a live demo.
     modal_timeout_seconds: float = Field(default=15.0, gt=0, le=600)
     modal_shards_per_scenario: int = Field(default=2, ge=1, le=16)
+
+    # Pydantic AI advice layer (Phase 5). `deterministic` never calls a model.
+    agent_mode: Literal["deterministic", "pydantic"] = "deterministic"
+    # Pydantic AI model string. `gateway/<provider>:<model>` routes through Pydantic AI Gateway.
+    agent_model: str = "gateway/anthropic:claude-haiku-4-5"
+    # Optional Gateway route: a provider slug or gateway-endpoint slug (Logfire -> Gateway).
+    gateway_route: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$")
+    # Per model request (HTTP) and whole agent run. On breach: deterministic fallback.
+    agent_request_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    agent_run_timeout_seconds: float = Field(default=60.0, gt=0, le=300)
+    agent_max_model_requests: int = Field(default=8, ge=2, le=30)
+
+    # Observability. Exported to Logfire only when a token/credentials are present.
+    environment: str = Field(default="dev", max_length=32)
+    # Model-facing content is allowlisted (no PII), so capturing it in traces is safe.
+    logfire_capture_model_content: bool = True
+
+    # Vendor credentials (unprefixed names, as documented by the vendors).
+    gateway_api_key: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("PYDANTIC_AI_GATEWAY_API_KEY", "PAIG_API_KEY")
+    )
+    gateway_base_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PYDANTIC_AI_GATEWAY_BASE_URL", "PAIG_BASE_URL"),
+    )
+    logfire_token: SecretStr | None = Field(default=None, validation_alias="LOGFIRE_TOKEN")
 
     @property
     def effective_workload(self) -> str:
