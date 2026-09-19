@@ -53,8 +53,10 @@ SikaRescue is a single-process demo. Its claims are deliberately narrow.
   the transaction goes to MANUAL_REVIEW, funds certainty is UNCERTAIN, automatic action is
   disabled, and the payout is never retried. The UI shows only the *last confirmed* location
   and says the recipient may already have been credited.
-- **Locally verified Modal results.** Rejected routes are never simulated, and every returned
-  shard is re-verified before use.
+- **Modal results are checked, not trusted.** Rejected routes are never sent for simulation.
+  Returned shards are validated for structure and consistency, and scores and ranks are
+  recomputed from them. The statistics themselves are not reproduced locally, so Modal can
+  influence the order of already-eligible routes, never their eligibility, fee or amount.
 - **The model cannot execute financial effects.** It has four read-only tools; its structured
   advice is checked against the deterministic plan and screened for personal data.
 - **Internal reconciliation checks** over this process's own journal (one sender debit, one
@@ -97,9 +99,10 @@ Modal is **not** used to make financial-policy decisions. The deterministic appl
 
 1. **filters unsafe routes before compute**: a policy-denied, down, incompatible or
    illiquid route is never sent for simulation;
-2. **verifies returned data after compute**: it re-derives hard constraints, fees, route
-   identity, scores and ranking locally, checks every shard against what was requested, and
-   rejects anything malformed;
+2. **checks returned data after compute**: it re-derives hard constraints, fees and route
+   identity, recomputes scores and ranks from the returned statistics, checks every shard
+   against what was requested, and rejects anything malformed. It does not reproduce the
+   simulated statistics themselves;
 3. **creates the plan** (bound to the transaction revision and sealed by a content hash);
 4. **owns approval** (a human approves exactly one immutable plan);
 5. **executes the payment state machine** (only the outstanding leg, at most once per
@@ -348,13 +351,17 @@ provider, code, message, transport outcome, acceptance stage, explicit rejection
 verbatim evidence fragments and completeness; nothing in it can authorise, rank or execute.
 An output validator sends back any citation that is not verbatim in the payload.
 
-The verifier (`services/evidence.py`) fails closed. Integrity checks: payload binding, provider
-match, every cited string verbatim, transport claim consistent with what OUR client observed,
-claims consistent with each other and with the provider's documented code catalog.
-DEFINITIVE_FAILED additionally requires a received response, an explicit rejection before
-acceptance, a documented pre-acceptance code and cited evidence. Everything else is UNKNOWN.
-Without a model (not configured, or failing) the fallback reads only our transport log, so
-it can never prove a definitive failure: a missing model fails closed.
+The verifier (`services/evidence.py`) fails closed, and the model has no positive authority:
+LLM may propose semantics; trusted deterministic evidence decides whether money may move.
+Every safety fact comes from trusted inputs: OUR client's transport observation, a strict
+deterministic parser for the provider's documented response schema (disposition, reason
+code, phase, whether a transfer was created, read from the actual body) and the code catalog.
+DEFINITIVE_FAILED requires a received response, a parsed body, disposition NOT_ACCEPTED, a
+documented pre-acceptance code and no created transfer. The model's proposal must be grounded
+(verbatim citations), claim exactly the observed transport, not contradict the parsed body,
+and propose the same rejection: necessary as corroboration, never sufficient. So a forged
+proposal cannot unlock recovery, and without a model (not configured, or failing) the
+envelope-only fallback proposes nothing and can never prove a definitive failure.
 
 Until a response is classified the journal holds only `ProviderResponseReceived`; the attempt
 is recorded once, from the verdict. Planning refuses with `EvidencePendingError` (no escalation).
@@ -371,10 +378,11 @@ payment instance, never by mutating one.
   The Phase 7A certainty fields are derived from it.
 - **FinancialEffectGraph**: PaymentIntent -> SenderDebit -> FX -> GhanaSettlement ->
   RecipientPayout, each node carrying only journal facts (effect key, amounts, rail, attempts).
-- **SafeActionFrontier**: candidates -> hard constraints -> eligible -> simulated -> ranked ->
-  selected, from the current fresh plan (or the live candidates before analysis). Under
-  UNKNOWN it holds only QUERY_PROVIDER (a demo abstraction), WAIT_FOR_PROVIDER_EVIDENCE and
-  MANUAL_REVIEW.
+- **Recovery candidate funnel** (`SafeActionFrontier`): candidates evaluated against hard
+  constraints -> eligible -> simulated -> ranked -> selected. Rejected and unevaluated
+  candidates are not actions; the approved plan is the only executable artifact. Under
+  UNKNOWN it holds no payout candidate, only QUERY_PROVIDER (a demo abstraction),
+  WAIT_FOR_PROVIDER_EVIDENCE and MANUAL_REVIEW.
 - **Ledger preview**: current vs proposed ledger for a plan, produced by posting the effect
   that execution would post (the same builders, `services/effects.py`) into
   `journal.fork()`. A test checks the projection equals what execution actually posts.
@@ -392,9 +400,10 @@ GHS payouts, seed 10421) is allocated to fallback rails under 5 scenarios.
 2. Modal (`allocate_outage_scenario`, one job per scenario) or local: oldest first, cheapest
    eligible rail with both liquidity and a capacity slot. The worker regenerates the portfolio
    from its seed and must reproduce its digest; it never sees policy.
-3. Local: every assignment re-verified (eligible rail, mask respected, liquidity and capacity
-   respected, maximal: nothing unserved still fits), and every metric recomputed from the
-   assignments. A failing result is discarded and recomputed locally, visibly.
+3. Local: every assignment checked (eligible rail, mask respected, liquidity and capacity
+   respected, maximal: nothing unserved still fits), and every reported metric recomputed from
+   the assignments. A failing result is discarded and recomputed locally, visibly. The rule is
+   a deterministic greedy allocation (oldest first, cheapest eligible rail), not an optimum.
 
 Measured on 2026-09-19 (Windows laptop client): Modal cold 13.8 s, warm about 1.4 s, local
 0.4 s for the same 5 scenarios; results identical. At this size Modal demonstrates the

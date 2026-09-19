@@ -11,8 +11,9 @@ What crosses to a compute worker (local thread or Modal container):
 What comes back: one assignment per obligation (a rail index, or UNSERVED). The caller
 re-verifies every assignment against the masks and budgets and recomputes all metrics itself.
 
-Allocation rule: oldest obligation first (ties by index); each goes to the cheapest eligible
-rail that still has both the liquidity and a capacity slot for it; otherwise it stays unserved.
+Allocation rule (deterministic greedy, not globally optimal): oldest obligation first (ties
+by index); each goes to the cheapest eligible rail that still has both the liquidity and a
+capacity slot for it; otherwise it stays unserved.
 """
 
 from __future__ import annotations

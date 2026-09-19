@@ -48,10 +48,13 @@ _CHECK_LABELS = {
     "citations_grounded": "Every citation appears verbatim",
     "transport_consistent": "Matches our client's transport log",
     "internally_consistent": "Consistent with itself and the code catalog",
-    "provider_response_received": "Provider response received",
-    "explicit_pre_acceptance_rejection": "Explicit rejection before acceptance",
-    "documented_rejection_code": "Documented pre-acceptance code",
-    "cited_evidence": "Verbatim evidence cited",
+    "matches_trusted_parse": "Does not contradict the parsed response body",
+    "provider_response_received": "Provider response received (our client log)",
+    "trusted_body_parsed": "Response body parsed against the documented schema",
+    "trusted_explicit_rejection": "Body shows an explicit rejection",
+    "trusted_pre_acceptance_code": "Body code is a documented pre-acceptance rejection",
+    "trusted_no_transfer": "Body shows no transfer was created",
+    "extraction_corroborates": "Extraction proposes the same rejection",
 }
 
 

@@ -204,8 +204,16 @@ async def test_tampered_hard_constraint_result_is_rejected(txn_id):
     ("fake", "timeout", "reason"),
     [
         (FakeModalFunction(delay=5.0), 0.05, "TimeoutError: no result within 0.05s"),
-        (FakeModalFunction(error=modal.exception.RemoteError("boom")), 5.0, "RemoteError: boom"),
-        (FakeModalFunction(error=ConnectionError("unreachable")), 5.0, "ConnectionError"),
+        (
+            FakeModalFunction(error=modal.exception.RemoteError("boom")),
+            5.0,
+            "RemoteError: remote compute failed",
+        ),
+        (
+            FakeModalFunction(error=ConnectionError("unreachable")),
+            5.0,
+            "ConnectionError: remote compute unreachable",
+        ),
         (FakeModalFunction(transform=_garbage), 5.0, "ComputeIntegrityError"),
     ],
     ids=["timeout", "remote-exception", "unavailable", "malformed"],
@@ -313,5 +321,35 @@ async def test_cli_shows_fallback_visibly(txn_id):
     text = out.getvalue()
     assert outcome.exit_code == 0
     assert "modal compute unavailable -> evaluated with local instead" in text
-    assert "reason: RemoteError: down" in text
+    assert "reason: RemoteError: remote compute failed" in text
     assert "compute backend          : local (fallback from modal)" in text
+
+
+# --- remote error text never reaches the API/UI ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        modal.exception.RemoteError("Traceback ... token=ak-SECRET123 at https://u:p@host/x"),
+        RuntimeError("Authorization: Bearer sk-live-SECRET body={'card': '4111'}"),
+        ConnectionError("https://user:hunter2@internal:8443/?key=SECRET"),
+        ValueError("SECRET response body"),
+    ],
+    ids=["remote-traceback", "runtime-with-header", "connection-with-credentials", "value"],
+)
+def test_describe_failure_never_echoes_remote_exception_text(error):
+    from sikarescue.compute.backend import describe_failure
+
+    reason = describe_failure(error, 15.0)
+    assert "SECRET" not in reason and "hunter2" not in reason and "http" not in reason
+    assert reason.startswith(type(error).__name__ + ": remote compute")
+
+
+def test_describe_failure_keeps_our_own_verification_messages():
+    from sikarescue.compute.backend import describe_failure
+
+    reason = describe_failure(ComputeIntegrityError(["TOKEN_BRIDGE: hard-constraint mismatch"]), 1)
+    assert reason.startswith("ComputeIntegrityError: result failed local verification")
+    assert "hard-constraint" in reason
+    assert describe_failure(TimeoutError(), 0.5) == "TimeoutError: no result within 0.5s"

@@ -6,11 +6,13 @@ Responsibilities are split exactly as in single-payment recovery:
      compatibility decide, per obligation, which rails it may use (eligibility masks). Rails
      that fail a hard constraint are never sent to compute at all.
   2. COMPUTE (Modal fan-out, one job per scenario, or local): the allocation kernel.
-  3. LOCAL, after compute: every assignment is re-verified against the masks, liquidity and
+  3. LOCAL, after compute: every assignment is checked against the masks, liquidity and
      capacity; the allocation must be maximal (nothing unserved still fits); and every metric
-     is recomputed from the assignments. A result that fails verification is discarded and
+     is recomputed from the assignments. A result that fails these checks is discarded and
      the scenario set is recomputed locally, visibly.
-Modal accelerates the kernel. It never sees policy and cannot allocate around it.
+Modal runs the kernel and proposes allocations. It never sees policy, and an allocation outside
+the masks or budgets is rejected locally. The rule is a deterministic greedy allocation, not a
+global optimum.
 """
 
 from __future__ import annotations

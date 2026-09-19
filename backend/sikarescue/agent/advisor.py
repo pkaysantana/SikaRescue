@@ -131,7 +131,8 @@ def describe_failure(exc: BaseException, config: AdvisorConfig) -> str:
         return f"advice contradicted the deterministic plan ({exc})"[:200]
     if isinstance(exc, PIILeakError):
         return "model boundary refused a payload (PII guard)"
-    return f"{type(exc).__name__}: {' '.join(str(exc).split())[:160]}"
+    # Never echo arbitrary exception text: it can carry URLs, headers or response bodies.
+    return f"{type(exc).__name__}: model call failed"
 
 
 _EFFECT_NAMES = {

@@ -1,5 +1,5 @@
-"""Systemic rail-outage analysis results. Every figure is recomputed locally from verified
-allocations; nothing here is taken on trust from a compute worker."""
+"""Systemic rail-outage analysis results. Every figure is recomputed locally from allocations
+that passed local feasibility checks; no reported metric is taken from a compute worker."""
 
 from __future__ import annotations
 

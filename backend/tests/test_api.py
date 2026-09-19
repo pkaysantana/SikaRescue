@@ -412,7 +412,7 @@ async def test_modal_fallback_is_reported_truthfully():
         summary = (await _analyse(c))["analysis"]["compute"]
         assert summary["configured_backend"] == "modal"
         assert (summary["backend"], summary["fallback_from"]) == ("local", "modal")
-        assert "modal unreachable" in summary["fallback_reason"]
+        assert summary["fallback_reason"] == "ConnectionError: remote compute unreachable"
 
 
 async def test_no_recipient_pii_in_any_response():

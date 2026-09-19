@@ -132,8 +132,11 @@ function VerdictBlock({ verdict }: { verdict: Verdict }) {
       <p className={`verdict verdict--${text.tone}`}>
         <span className="mono">{verdict.classification}</span> {text.title}
       </p>
-      <CheckList checks={verdict.checks} label="Integrity checks" />
-      <p className="checklist-head">To prove a definitive failure, all of these must hold:</p>
+      <p className="checklist-head">The AI proposal is checked against the payload:</p>
+      <CheckList checks={verdict.checks} label="Proposal checks" />
+      <p className="checklist-head">
+        A definitive failure needs all of these trusted facts, read by deterministic code:
+      </p>
       <CheckList checks={verdict.requirements} label="Definitive-failure requirements" />
       {verdict.recorded_outcome !== verdict.classification && (
         <p className="warning-note">
@@ -162,8 +165,9 @@ export function EvidencePanel({ view, pending, onClassify, sectionRef }: Evidenc
       <h2 id="evidence-title">Classify the provider's response</h2>
       <p className="lead">
         {incident.rail_id} answered the payout, and what it said decides whether money may move.
-        Pydantic AI extracts typed evidence with verbatim citations. A deterministic verifier
-        decides, and anything it can't prove is UNKNOWN. The AI can't authorise a payout.
+        Pydantic AI proposes typed evidence with verbatim citations. A deterministic verifier
+        reads the response body itself and decides; anything it can't prove is UNKNOWN. The
+        AI's proposal alone can't authorise a payout.
       </p>
       <ol className="evidence-flow">
         <li className="evidence-stage">
@@ -177,7 +181,7 @@ export function EvidencePanel({ view, pending, onClassify, sectionRef }: Evidenc
           </pre>
         </li>
         <li className="evidence-stage">
-          <h3>FailureEvidence</h3>
+          <h3>FailureEvidence (AI proposal)</h3>
           {extraction ? (
             <>
               <p className="muted small">

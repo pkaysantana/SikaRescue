@@ -2,7 +2,9 @@
 
 Everything except the Monte Carlo statistics is re-derived locally from the candidates, so a
 backend (local, remote, buggy or malicious) can never admit a policy-denied / down /
-incompatible / illiquid route, alter a fee or amount, or change a score or ranking.
+incompatible / illiquid route or alter a fee or amount. Scores and ranks are recomputed from
+the returned statistics and must match; the statistics themselves are NOT reproduced locally,
+so a forged but internally consistent result could change the order of eligible routes.
 """
 
 from __future__ import annotations

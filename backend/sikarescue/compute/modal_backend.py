@@ -2,7 +2,8 @@
 
 Hard filters run HERE, in-process, before anything is sent; only routes that passed every
 hard constraint are simulated remotely. Scores and ranks are assembled locally from the
-merged statistics, and the recovery service re-verifies the whole batch again afterwards.
+merged statistics, and the recovery service checks the whole batch again afterwards
+(structure, eligibility, money, recomputed scores and ranks; not the statistics themselves).
 `modal` is imported lazily so the local path never depends on it.
 """
 

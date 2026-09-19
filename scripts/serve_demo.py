@@ -4,6 +4,7 @@ The repository, journal and locks are in-memory, so this must never run with >1 
 
   npm --prefix frontend install && npm --prefix frontend run build     # once
   uv run python scripts/serve_demo.py --compute modal --agent pydantic  # http://127.0.0.1:8000
+  uv run python scripts/serve_demo.py --compute modal --agent pydantic --record   # recording
 
 Frontend development instead: run this, then `npm --prefix frontend run dev` (port 5173).
 """
@@ -21,6 +22,12 @@ def main() -> int:
     parser.add_argument(
         "--agent", choices=("deterministic", "pydantic"), help="override advice orchestrator"
     )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="refuse to start unless the recording configuration (Pydantic AI via Gateway "
+        "route sr, Gemini 3.8 Flash, Modal) is in place",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
@@ -32,6 +39,7 @@ def main() -> int:
         import pydantic_ai
         import uvicorn
 
+        from sikarescue.agent.live import recording_problems
         from sikarescue.api.app import DEFAULT_FRONTEND_DIST, create_app
         from sikarescue.config import Settings
     except ImportError:
@@ -39,6 +47,17 @@ def main() -> int:
 
     pydantic_ai.BANNER_ENABLED = False
     settings = Settings()
+    if args.record:
+        problems = recording_problems(settings)
+        if problems:
+            print("NOT STARTED: this is not the recording configuration.")
+            for problem in problems:
+                print(f"  - {problem}")
+            print(
+                "Use: uv run python scripts/serve_demo.py --compute modal --agent pydantic --record"
+            )
+            return 2
+        print("recording check: agent=pydantic, Gateway route=sr, Gemini 3.8 Flash, Modal")
     app = create_app(settings)
     frontend = (DEFAULT_FRONTEND_DIST / "index.html").is_file()
     print(f"compute backend : {settings.compute_backend} ({settings.effective_workload} workload)")

@@ -6,12 +6,13 @@ Deploy:   uv run modal deploy -m sikarescue.compute.modal_app
 Invoked by `ModalRouteComputeBackend` via `modal.Function.from_name(...).map.aio(...)`.
 
 The worker only runs the pure simulation kernel on the inputs it is given. It never sees
-policy, liquidity, money or transaction state, and it cannot change them: the calling
-application re-verifies everything it returns.
+policy, liquidity, money or transaction state, and it cannot change them. The caller validates
+structure and consistency, enforces hard constraints and recomputes scores and metrics from
+what it returns; it does not reproduce the simulated statistics themselves.
 
 `allocate_outage_scenario` runs the systemic-outage allocation kernel for ONE scenario. It
-receives eligibility masks already decided by local policy, never the policy itself, and the
-caller re-verifies every assignment and recomputes every metric.
+receives eligibility masks already decided by local policy, never the policy itself; the
+caller checks every assignment's feasibility and recomputes every reported metric.
 """
 
 from __future__ import annotations

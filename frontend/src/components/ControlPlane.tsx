@@ -121,7 +121,7 @@ export function EffectGraph({ view }: { view: DemoView }) {
   );
 }
 
-// ------------------------------------------------------------------ safe action frontier
+// ------------------------------------------------------------------ recovery candidate funnel
 
 function Funnel({ f }: { f: Frontier }) {
   const stages = [
@@ -155,10 +155,10 @@ export function FrontierPanel({
   const blocked = !f.payout_actions_permitted;
   return (
     <section className="step-section frontier" ref={sectionRef} aria-labelledby="frontier-title">
-      <h2 id="frontier-title">Safe action frontier</h2>
+      <h2 id="frontier-title">Recovery candidate funnel</h2>
       {blocked ? (
         <p className="frontier-blocked" role="status">
-          Manual review required. There is no executable payout.
+          Manual review required. There is no payout candidate and no executable payout.
         </p>
       ) : (
         <Funnel f={f} />

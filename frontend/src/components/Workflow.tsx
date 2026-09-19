@@ -392,10 +392,17 @@ export function ExecutionPanel({ view, pending, onExecute, sectionRef }: Execute
           );
         })}
       </ol>
-      {view.execution && view.execution.status !== "SUCCEEDED" && (
+      {view.execution?.status === "OUTCOME_UNKNOWN" && (
         <p className="error-note">
-          Payout outcome {view.execution.status}: {view.execution.detail}. No automatic retry:
-          this needs manual review.
+          Automatic recovery halted: the payout outcome is unknown ({view.execution.detail}), so
+          the recipient may already have been credited. Manual review required; it is never
+          retried automatically.
+        </p>
+      )}
+      {view.execution?.status === "FAILED" && (
+        <p className="error-note">
+          The payout was definitively rejected before acceptance ({view.execution.detail}). No
+          value moved. A new analysis, a new plan and a new approval are required.
         </p>
       )}
     </section>

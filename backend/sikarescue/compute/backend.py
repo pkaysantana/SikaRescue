@@ -6,8 +6,9 @@ Contract every backend honours:
   * semantics of `compute.evaluation` (hard filters before simulation; rejected routes are
     never simulated, scored or ranked);
   * deterministic for a given request (seeded, counter-based simulation).
-The recovery service independently re-verifies eligibility, money, scores and ranking of
-every batch before it can influence a plan, so a backend can only contribute statistics.
+The recovery service independently re-checks eligibility and money, and recomputes scores
+and ranks from the returned statistics, before a batch can influence a plan. A backend
+contributes only statistics; those are validated for structure and consistency, not reproduced.
 
 Implementations: `LocalRouteComputeBackend` (in-process) and
 `compute.modal_backend.ModalRouteComputeBackend` (Modal fan-out), which is always wrapped in
@@ -70,11 +71,21 @@ class LocalRouteComputeBackend(RouteComputeBackend):
 
 
 def describe_failure(exc: BaseException, timeout_seconds: float) -> str:
-    """Short, secret-free description of why a remote backend failed."""
-    if isinstance(exc, TimeoutError) and not str(exc):
+    """Short, secret-free description of why a remote backend failed. Allowlisted.
+
+    Remote exception text can carry anything (URLs, headers, tokens, response bodies), so it
+    is never echoed. Only our own local-verification messages are passed through; every other
+    failure is reported by exception class alone.
+    """
+    name = type(exc).__name__
+    if isinstance(exc, TimeoutError):
         return f"TimeoutError: no result within {timeout_seconds:g}s"
-    message = " ".join(str(exc).split())[:200] or "no details"
-    return f"{type(exc).__name__}: {message}"[:280]
+    if isinstance(exc, ComputeIntegrityError):  # written by our own verifier, not the remote
+        detail = " ".join(str(exc).split())[:200]
+        return f"ComputeIntegrityError: result failed local verification ({detail})"[:280]
+    if isinstance(exc, ConnectionError | OSError):
+        return f"{name}: remote compute unreachable"
+    return f"{name}: remote compute failed"
 
 
 class FallbackComputeBackend(RouteComputeBackend):

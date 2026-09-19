@@ -95,9 +95,11 @@ export function OutagePanel({ outage, running, disabled, onRun }: OutageProps) {
       <header className="outage-head">
         <h1>Systemic outage: MOMO_A fails for the whole corridor</h1>
         <p className="lead">
-          How many stranded payouts can each fallback rail safely absorb? Rail status, corridor
-          policy and recipient compatibility are decided locally. The allocation kernel then runs
-          one job per scenario, and every allocation is re-verified before any figure is shown.
+          How many stranded payouts can each fallback rail absorb within its liquidity and
+          capacity? Rail status, corridor policy and recipient compatibility are decided locally.
+          Modal proposes one allocation per scenario using a deterministic greedy rule (oldest
+          first, cheapest eligible rail; not globally optimal). Local code enforces the hard
+          constraints, checks feasibility and recomputes every reported metric.
         </p>
         <button className="primary" onClick={onRun} disabled={disabled || running}>
           {running ? (

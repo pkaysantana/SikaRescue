@@ -31,7 +31,11 @@ from sikarescue.models import (
     RecoveryState,
     SettlementLegStatus,
 )
-from sikarescue.services.evidence import envelope_evidence, verify_failure_evidence
+from sikarescue.services.evidence import (
+    envelope_evidence,
+    parse_provider_response,
+    verify_failure_evidence,
+)
 
 from helpers import (
     DEFINITIVE_EXTRACTION,
@@ -211,9 +215,16 @@ async def test_unknown_classification_goes_to_manual_review_and_moves_nothing():
 async def test_success_evidence_is_never_booked_as_a_credit():
     world = _world(IncidentScenario.DEFINITIVE)
     incident = _incident(world)
-    # A (synthetic) success claim that is fully grounded in a success payload.
+    # A (synthetic) success payload: completed disposition, success code, a created transfer.
     payload_success = incident.model_copy(
-        update={"raw_payload": incident.raw_payload.replace("MA-4017", "MA-2001")}
+        update={
+            "raw_payload": _rewrite(
+                incident.raw_payload,
+                ("MA-4017", "MA-2001"),
+                ('"disposition": "NOT_ACCEPTED"', '"disposition": "COMPLETED"'),
+                ('"transfer": null', '"transfer": {"ref": "matrf_91c0"}'),
+            )
+        }
     )
     success = ExtractedFailureEvidence.model_validate(
         DEFINITIVE_EXTRACTION
@@ -259,6 +270,124 @@ def _digest(text: str) -> str:
     from sikarescue.models import sha256_text
 
     return sha256_text(text)
+
+
+def _rewrite(text: str, *pairs: tuple[str, str]) -> str:
+    for old, new in pairs:
+        assert old in text
+        text = text.replace(old, new)
+    return text
+
+
+def _variant(world, *pairs: tuple[str, str]):
+    """The world's incident with an edited (still synthetic) payload, digest recomputed."""
+    incident = _incident(world)
+    payload = _rewrite(incident.raw_payload, *pairs)
+    return incident.model_copy(
+        update={"raw_payload": payload, "raw_payload_digest": _digest(payload)}
+    )
+
+
+# ============================================================ the model has no positive authority
+
+
+def test_forged_semantics_with_a_real_code_and_irrelevant_citation_stay_unknown():
+    """The provider ACCEPTED the payout (MA-5020, pending). The body mentions MA-4017 only in
+    unrelated help text. A bad extraction picks that real, grounded code, cites an irrelevant
+    but verbatim fragment, and forges PRE_ACCEPTANCE + explicit_rejection=true."""
+    world = _world(IncidentScenario.DEFINITIVE)
+    accepted = _variant(
+        world,
+        ('"disposition": "NOT_ACCEPTED"', '"disposition": "ACCEPTED"'),
+        ('"phase": "pre-queue validation"', '"phase": "queued for wallet credit"'),
+        ('"code": "MA-4017"', '"code": "MA-5020", "help": "see MA-4017 for wallet setup"'),
+    )
+    forged = ExtractedFailureEvidence.model_validate(
+        {
+            "provider": "MOMO_A",
+            "provider_code": "MA-4017",  # real, documented, and present in the payload
+            "provider_message": None,
+            "transport_outcome": "RESPONSE_RECEIVED",
+            "acceptance_stage": "PRE_ACCEPTANCE",  # forged
+            "explicit_rejection": True,  # forged
+            "provider_reference": None,
+            "evidence_fragments": ["x-api-version: 3.4"],  # verbatim but irrelevant
+            "completeness": "COMPLETE",
+        }
+    )
+    evidence = FailureEvidence.bind(accepted, forged, EvidenceSource.PYDANTIC_AI)
+    assert all(
+        c.passed for c in evidence_checks(accepted, evidence) if c.name != "matches_trusted_parse"
+    )
+    verdict = verify_failure_evidence(accepted, evidence, CATALOG)
+    assert verdict.classification is AttemptOutcome.UNKNOWN
+    failed = {c.name for c in (*verdict.checks, *verdict.requirements) if not c.passed}
+    assert {
+        "matches_trusted_parse",
+        "trusted_explicit_rejection",
+        "trusted_pre_acceptance_code",
+    } <= failed
+
+
+def test_trusted_facts_come_from_the_body_not_the_model():
+    world = _world(IncidentScenario.DEFINITIVE)
+    parsed = parse_provider_response(_incident(world))
+    assert parsed is not None
+    assert (parsed.disposition, parsed.code, parsed.phase, parsed.transfer_created) == (
+        "NOT_ACCEPTED",
+        "MA-4017",
+        "pre-queue validation",
+        False,
+    )
+    # Remove the proposal's code and semantics: the trusted facts still hold, but without
+    # the extraction corroborating them the verdict fails closed.
+    silent = DEFINITIVE_EXTRACTION | {
+        "provider_code": None,
+        "acceptance_stage": "UNKNOWN",
+        "explicit_rejection": None,
+    }
+    verdict = verify_failure_evidence(_incident(world), _evidence(world, silent), CATALOG)
+    assert verdict.classification is AttemptOutcome.UNKNOWN
+    passed = {r.name for r in verdict.requirements if r.passed}
+    assert {
+        "trusted_explicit_rejection",
+        "trusted_pre_acceptance_code",
+        "trusted_no_transfer",
+    } <= passed
+
+
+def test_unparseable_or_mismatched_body_fails_closed():
+    world = _world(IncidentScenario.DEFINITIVE)
+    for pairs in (
+        (('"outcome": {', '"result": {'),),  # undocumented schema
+        (("HTTP/1.1 200 OK", "HTTP/1.1 202 Accepted"),),  # status differs from our client log
+        (('"transfer": null,', ""),),  # transfer state not stated
+    ):
+        incident = _variant(world, *pairs)
+        assert parse_provider_response(incident) is None
+        evidence = FailureEvidence.bind(
+            incident,
+            ExtractedFailureEvidence.model_validate(DEFINITIVE_EXTRACTION),
+            EvidenceSource.PYDANTIC_AI,
+        )
+        verdict = verify_failure_evidence(incident, evidence, CATALOG)
+        assert verdict.classification is AttemptOutcome.UNKNOWN
+
+
+def test_transport_claim_must_match_the_observation_exactly():
+    world = _world(IncidentScenario.UNKNOWN)  # our client observed TIMEOUT
+    for claim, consistent in (("TIMEOUT", True), ("NOT_STATED", True), ("CONNECTION_LOST", False)):
+        verdict = _verdict(
+            IncidentScenario.UNKNOWN, UNKNOWN_EXTRACTION | {"transport_outcome": claim}
+        )
+        check = next(c for c in verdict.checks if c.name == "transport_consistent")
+        assert check.passed is consistent
+        assert verdict.classification is AttemptOutcome.UNKNOWN
+    assert world is not None
+
+
+def evidence_checks(incident, evidence):
+    return verify_failure_evidence(incident, evidence, CATALOG).checks
 
 
 # ============================================================ the extraction agent

@@ -335,7 +335,7 @@ def _plan_actions(plan: RecoveryPlan) -> tuple[FrontierAction, ...]:
         FrontierAction(
             action_id=f"payout_{e.rail_id.value.lower()}",
             kind=FrontierActionKind.PAYOUT,
-            label=f"Pay the outstanding obligation via {e.rail_id}",
+            label=f"Candidate route via {e.rail_id}",
             rail_id=e.rail_id,
             moves_value=True,
             hard_constraint_status=e.hard_constraint_status,
@@ -361,7 +361,7 @@ def _candidate_actions(
             FrontierAction(
                 action_id=f"payout_{c.rail.rail_id.value.lower()}",
                 kind=FrontierActionKind.PAYOUT,
-                label=f"Pay the outstanding obligation via {c.rail.rail_id}",
+                label=f"Candidate route via {c.rail.rail_id}",
                 rail_id=c.rail.rail_id,
                 moves_value=True,
                 hard_constraint_status=HardConstraintStatus.REJECTED
@@ -426,8 +426,9 @@ def build_safe_action_frontier(
             counts=_counts(actions),
             plan_id=plan.plan_id,
             plan_hash=plan.plan_hash,
-            reason="Deterministic plan: hard constraints first, then simulation of the "
-            "survivors, then ranking. Only the rank-1 route can be approved.",
+            reason="Candidates evaluated against hard constraints first; only eligible ones "
+            "were simulated and ranked. Rejected candidates are not actions. The selected plan is "
+            "the only executable artifact, and only after approval.",
         )
     actions = _candidate_actions(candidates or ())
     return SafeActionFrontier(
@@ -436,7 +437,8 @@ def build_safe_action_frontier(
         payout_actions_permitted=True,
         actions=actions,
         counts=_counts(actions),
-        reason="Candidates after hard constraints; not simulated or ranked until analysed.",
+        reason="Candidate routes evaluated against hard constraints. Eligible candidates are "
+        "simulated and ranked only when analysed; none is executable without an approved plan.",
     )
 
 

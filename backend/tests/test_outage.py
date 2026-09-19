@@ -217,7 +217,7 @@ async def test_modal_unavailable_falls_back_to_local_visibly():
         "modal", remote_function=FakeModalFunction(error=ConnectionError("modal unreachable"))
     ).run()
     assert (remote.backend, remote.fallback_from) == ("local", "modal")
-    assert "modal unreachable" in remote.fallback_reason
+    assert remote.fallback_reason == "ConnectionError: remote compute unreachable"
 
 
 def test_worker_refuses_a_portfolio_it_cannot_reproduce():

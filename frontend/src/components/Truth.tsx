@@ -75,7 +75,9 @@ export function Journey({ view }: { view: DemoView }) {
   return (
     <section className="journey" aria-labelledby="journey-title">
       <div className="journey-head">
-        <h2 id="journey-title">Where the money is</h2>
+        <h2 id="journey-title">
+          {uncertain ? "Last confirmed money position" : "Where the money is"}
+        </h2>
         <div className="segmented" role="group" aria-label="Journey view">
           <button
             className={`segment${mode === "legs" ? " segment--on" : ""}`}

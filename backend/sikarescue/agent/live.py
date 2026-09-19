@@ -42,6 +42,36 @@ def preflight(settings: Settings, model_name: str | None = None) -> tuple[list[s
     return lines, missing
 
 
+# The one configuration the demo recording is made with (verified live, 2026-09-19).
+RECORDING_AGENT_MODE = "pydantic"
+RECORDING_COMPUTE_BACKEND = "modal"
+RECORDING_GATEWAY_ROUTE = "sr"
+RECORDING_MODEL_SUFFIX = ":models/gemini-3.8-flash"
+
+
+def recording_problems(settings: Settings) -> list[str]:
+    """Why this configuration must NOT be used for the recording (empty list = ready).
+
+    Without Pydantic AI the evidence fallback deliberately cannot prove a definitive
+    failure, so the definitive scenario would stop in MANUAL_REVIEW. Refuse up front instead.
+    Reports names and expected values only, never secrets.
+    """
+    problems: list[str] = []
+    if settings.agent_mode != RECORDING_AGENT_MODE:
+        problems.append(f"agent mode is {settings.agent_mode!r}; expected 'pydantic'")
+    if settings.compute_backend != RECORDING_COMPUTE_BACKEND:
+        problems.append(f"compute backend is {settings.compute_backend!r}; expected 'modal'")
+    if settings.gateway_route != RECORDING_GATEWAY_ROUTE:
+        problems.append(f"Gateway route is {settings.gateway_route!r}; expected 'sr'")
+    if not settings.agent_model.endswith(RECORDING_MODEL_SUFFIX):
+        problems.append(
+            f"model is {settings.agent_model!r}; expected one ending in {RECORDING_MODEL_SUFFIX!r}"
+        )
+    _, missing = preflight(settings)
+    problems.extend(f"missing {m}" for m in missing)
+    return problems
+
+
 @dataclass
 class HeaderRecorder:
     """httpx/httpx2 response hook: keeps status, destination and selected headers of every
